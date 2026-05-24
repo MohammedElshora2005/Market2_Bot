@@ -335,10 +335,18 @@ async function getUserOrders(userId) {
         const orders = [];
         for (const row of rows) {
             if (row.get('ID') === userId.toString()) {
+                let subtotal = parseFloat(row.get('الإجمالي')) || 0;
+                let netPrice = parseFloat(row.get('الصافي')) || 0;
+                
+                // إذا كان الصافي صفر ولكن المجموع أكبر من صفر
+                if (netPrice === 0 && subtotal > 0) {
+                    netPrice = subtotal;
+                }
+                
                 orders.push({
                     orderNumber: row.get('رقم الطلب') || '',
-                    price: parseFloat(row.get('الإجمالي')) || 0,
-                    netPrice: parseFloat(row.get('الصافي')) || 0,
+                    price: subtotal,
+                    netPrice: netPrice,
                     tierDiscount: parseFloat(row.get('خصم المستوى')) || 0,
                     couponDiscount: parseFloat(row.get('خصم الكوبون')) || 0,
                     couponUsed: row.get('الكوبون المستخدم') || '',
@@ -371,7 +379,6 @@ async function getOrderByNumber(orderNumber) {
                 const tierDiscount = parseFloat(row.get('خصم المستوى')) || 0;
                 const couponDiscount = parseFloat(row.get('خصم الكوبون')) || 0;
                 
-                // إذا كان الصافي صفر ولكن المجموع أكبر من صفر، استخدم المجموع
                 if (netPrice === 0 && subtotal > 0) {
                     netPrice = subtotal;
                 }
@@ -510,7 +517,7 @@ async function getAllCustomers() {
     }
 }
 
-// ============ دوال التقييم المُصَححة ============
+// ============ دوال التقييم ============
 async function saveFeedback(userId, userName, rating, message, orderNumber = '') {
     try {
         const doc = await getDoc();
@@ -837,7 +844,7 @@ async function enterCoupon(ctx) {
     sessions.set(ctx.from.id, session);
 }
 
-// ============ عرض الطلبات ============
+// ============ عرض الطلبات المُصَحح ============
 async function showOrders(ctx) {
     const userId = ctx.from.id;
     const orders = await getUserOrders(userId);
@@ -861,7 +868,7 @@ async function showOrders(ctx) {
         
         msg += `${i+1}. ${icon} <b>${order.date}</b>\n`;
         msg += `   🏷️ <code>${order.orderNumber}</code>\n`;
-        msg += `   💰 ${order.netPrice} ج\n`;
+        msg += `   💰 <b>${order.netPrice} ج</b>\n`;
         if (order.tierDiscount > 0) msg += `   🏆 خصم المستوى: ${order.tierDiscount} ج\n`;
         if (order.couponDiscount > 0) msg += `   🎟️ خصم الكوبون: ${order.couponDiscount} ج\n`;
         msg += `   📍 ${order.status}\n`;
@@ -878,7 +885,7 @@ async function showOrders(ctx) {
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 }
 
-// ============ تتبع الطلب المُصَحح ============
+// ============ تتبع الطلب ============
 async function trackOrder(ctx, orderNumber) {
     if (!orderNumber || orderNumber.length < 10) {
         await ctx.reply('❌ رقم الطلب غير صحيح\n\nالرجاء إرسال رقم صحيح (مثال: ORD-1734567890123-7573)');
@@ -1589,7 +1596,7 @@ bot.action('confirm_cancel', async (ctx) => {
     await confirmCancel(ctx);
 });
 
-// أزرار التقييم
+// ============ أزرار التقييم المُصَححة ============
 for (let i = 1; i <= 5; i++) {
     bot.action(new RegExp(`rate_${i}(?:_(.*))?`), async (ctx) => {
         const rating = i;
@@ -1619,6 +1626,7 @@ for (let i = 1; i <= 5; i++) {
     });
 }
 
+// ✅ زر إضافة ملاحظة - يعمل بشكل صحيح
 bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     const rating = ctx.match[2];
@@ -1629,7 +1637,9 @@ bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
     session.pendingRating = { orderNumber, rating };
     sessions.set(ctx.from.id, session);
     
-    await ctx.reply('📝 <b>أضف ملاحظاتك</b>\n\n✏️ اكتب ملاحظاتك أو اقتراحاتك هنا:');
+    await ctx.reply('📝 <b>أضف ملاحظاتك</b>\n\n✏️ اكتب ملاحظاتك أو اقتراحاتك هنا:\n\n(مثال: خدمة ممتازة أو اقتراح بإضافة منتج معين)', {
+        parse_mode: 'HTML'
+    });
 });
 
 bot.action(/rate_order_(.+)/, async (ctx) => {
@@ -1643,7 +1653,7 @@ bot.action(/rate_order_(.+)/, async (ctx) => {
     await showFeedbackButtons(ctx, orderNumber);
 });
 
-// ============ معالج النصوص المُصَحح ============
+// ============ معالج النصوص المُصَحح (الأولويات الصحيحة) ============
 bot.on('text', async (ctx) => {
     const userId = ctx.from.id;
     const text = ctx.message.text.trim();
@@ -1659,19 +1669,25 @@ bot.on('text', async (ctx) => {
     if (lastMessage && Date.now() - lastMessage < 1000) return;
     userCooldowns.set(userId, Date.now());
     
-    // الأولوية 1: ملاحظات التقييم
+    // ✅ الأولوية 1 والأعلى: ملاحظات التقييم (قبل أي شيء آخر!)
     if (session.status === 'feedback_note' && session.pendingRating) {
         const { orderNumber, rating } = session.pendingRating;
+        
+        // حفظ الملاحظة في جدول Feedbakes
         await saveFeedback(userId, session.name || ctx.from.first_name, parseInt(rating), text, orderNumber);
+        
+        // إنهاء حالة التقييم
         session.status = 'main';
         session.pendingRating = null;
         sessions.set(userId, session);
         
+        // تأكيد الاستلام
         await ctx.reply('🙏 <b>شكراً لملاحظاتك!</b>\n\nتم استلام ملاحظاتك وسنعمل على تحسين خدماتنا.', {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
         });
-        return;
+        
+        return; // مهم جداً: لا نكمل معالجة النص كمنتج
     }
     
     // الأولوية 2: إدخال كوبون
