@@ -4,39 +4,27 @@ import { JWT } from 'google-auth-library';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ============ الإعدادات المتقدمة ============
+// ============ الإعدادات ============
 const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 const ITEMS_PER_PAGE = 6;
 const CACHE_TTL = 300000;
 const CART_EXPIRY_HOURS = 48;
-const OFFERS_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
-const MAX_ORDERS_DISPLAY = 10;
-const MAX_CART_ITEMS = 50;
-const MIN_ORDER_AMOUNT = 10;
-const DELIVERY_FEE = 0;
-const FREE_DELIVERY_AMOUNT = 200;
 
 // ============ قاعدة البيانات المؤقتة ============
-const sessions = new Map();
-const carts = new Map();
-const userCooldowns = new Map();
-const offeredCustomers = new Map();
-const broadcastQueue = new Map();
+const sessions = new Map();      // جلسات المستخدمين
+const carts = new Map();          // سلات الشراء
+const userCooldowns = new Map();  // منع السبام
 let currentPage = 0;
 let currentProducts = [];
 let currentSearch = '';
-let lastOffersHash = '';
-let isBroadcasting = false;
 
 // ============ كاش البيانات ============
 let productsCache = null;
 let productsCacheTime = 0;
 let offersCache = null;
 let offersCacheTime = 0;
-let statsCache = null;
-let statsCacheTime = 0;
 
-// ============ كلاس جلسة المستخدم المتطور ============
+// ============ كلاس جلسة المستخدم ============
 class UserSession {
     constructor(userId, name = '', username = '') {
         this.userId = userId;
@@ -44,64 +32,54 @@ class UserSession {
         this.username = username;
         this.address = '';
         this.phone = '';
-        this.status = 'main';
+        this.status = 'main';  // main, ordering_name, ordering_address, ordering_phone, searching, tracking, feedback_note, editing
         this.lastActivity = Date.now();
-        this.totalOrders = 0;
         this.totalSpent = 0;
         this.loyaltyPoints = 0;
         this.lastOrderNumber = null;
-        this.editingOrder = null;
-        this.editCart = [];
-        this.pendingRating = null;
-        this.tempOrderNumber = null;
-        this.language = 'ar';
-        this.notifications = true;
-        this.favoriteProducts = [];
-        this.lastSearchQuery = '';
-        this.referralCode = null;
-        this.referredBy = null;
+        this.editingOrder = null;      // رقم الطلب الجاري تعديله
+        this.editCart = [];             // منتجات التعديل المؤقتة
+        this.pendingRating = null;      // تقييم معلق
+        this.tempOrderNumber = null;    // رقم طلب مؤقت للإلغاء
     }
     
     updateActivity() {
         this.lastActivity = Date.now();
     }
     
-    addLoyaltyPoints(amount) {
-        this.loyaltyPoints += Math.floor(amount / 10);
-        return this.loyaltyPoints;
+    // حساب المستوى بناءً على إجمالي المشتريات
+    getTier() {
+        if (this.totalSpent >= 5000) return { name: '💎 بلاتينيوم', discount: 10, minSpent: 5000 };
+        if (this.totalSpent >= 2000) return { name: '🌟 ذهبي', discount: 7, minSpent: 2000 };
+        if (this.totalSpent >= 500) return { name: '⭐ فضي', discount: 5, minSpent: 500 };
+        if (this.totalSpent >= 100) return { name: '🟤 برونزي', discount: 3, minSpent: 100 };
+        return { name: '🟣 جديد', discount: 0, minSpent: 0 };
     }
     
-    getTier() {
-        if (this.totalSpent >= 5000) return { name: '💎 بلاتينيوم', discount: 10, color: '🔷' };
-        if (this.totalSpent >= 2000) return { name: '🌟 ذهبي', discount: 7, color: '🟡' };
-        if (this.totalSpent >= 500) return { name: '⭐ فضي', discount: 5, color: '⚪' };
-        if (this.totalSpent >= 100) return { name: '🟢 برونزي', discount: 3, color: '🟤' };
-        return { name: '🟣 جديد', discount: 0, color: '🟣' };
+    // إضافة نقاط ولاء
+    addLoyaltyPoints(amount) {
+        const points = Math.floor(amount / 10);
+        this.loyaltyPoints += points;
+        return points;
     }
 }
 
-// ============ كلاس عنصر السلة المتطور ============
+// ============ كلاس عنصر السلة ============
 class CartItem {
-    constructor(name, price, quantity = 1, unit = 'قطعة') {
+    constructor(name, price, quantity = 1) {
         this.id = Date.now().toString();
         this.name = name;
         this.price = price;
         this.quantity = Math.min(quantity, 99);
-        this.unit = unit;
         this.addedAt = Date.now();
-        this.notes = '';
     }
     
     get total() {
         return this.price * this.quantity;
     }
-    
-    get display() {
-        return `${this.quantity} × ${this.name} (${this.price}ج) = ${this.total}ج`;
-    }
 }
 
-// ============ دوال جوجل شيت المتقدمة ============
+// ============ دوال جوجل شيت ============
 let docInstance = null;
 let authInstance = null;
 
@@ -139,16 +117,13 @@ async function getProducts(forceRefresh = false) {
         for (const row of rows) {
             const name = row.get('المنتج');
             const price = parseFloat(row.get('السعر'));
-            const unit = row.get('الوحدة') || 'قطعة';
             const available = row.get('التوفر');
-            const category = row.get('التصنيف') || 'عام';
-            const description = row.get('الوصف') || '';
             let isAvailable = true;
             if (available === '0' || available === 'غير متوفر' || available === 'لا') {
                 isAvailable = false;
             }
             if (name && price && !isNaN(price) && price > 0 && isAvailable) {
-                products.push({ name, price, unit, category, description });
+                products.push({ name, price });
             }
         }
         productsCache = products;
@@ -176,10 +151,8 @@ async function getOffers(forceRefresh = false) {
             const active = row.get('نشط');
             const text = row.get('العرض');
             const date = row.get('التاريخ');
-            const code = row.get('الكود') || '';
-            const discount = row.get('الخصم') || 0;
             if (active === 'نعم' && text) {
-                offers.push({ text, date: date || new Date().toLocaleString('ar-EG'), code, discount: parseInt(discount) });
+                offers.push({ text, date: date || new Date().toLocaleString('ar-EG') });
             }
         }
         offersCache = offers;
@@ -191,46 +164,42 @@ async function getOffers(forceRefresh = false) {
     }
 }
 
-async function saveOrder(userId, customerName, address, phone, items, total, discount = 0, finalTotal = null) {
+async function saveOrder(userId, customerName, address, phone, items, total) {
     try {
         const doc = await getDoc();
         let sheet = doc.sheetsByTitle['Orders'];
         if (!sheet) {
             sheet = await doc.addSheet({
                 title: 'Orders',
-                headerValues: ['ID', 'اسم العميل', 'الطلبات', 'الإجمالي', 'الخصم', 'الصافي', 'العنوان', 'رقم الهاتف', 'التاريخ', 'عدد العناصر', 'رقم الطلب', 'الحالة', 'ملاحظات']
+                headerValues: ['ID', 'اسم العميل', 'الطلبات', 'الإجمالي', 'العنوان', 'رقم الهاتف', 'التاريخ', 'عدد العناصر', 'رقم الطلب', 'الحالة']
             });
         }
         
         const orderText = items.map(item => `${item.quantity} × ${item.name} (${item.price}ج)`).join('\n• ');
         const timestamp = Date.now();
         const orderNumber = `ORD-${timestamp}-${userId.toString().slice(-4)}`;
-        const netTotal = finalTotal || (total - discount);
         
         await sheet.addRow({
             'ID': userId.toString(),
             'اسم العميل': customerName,
             'الطلبات': `• ${orderText}`,
             'الإجمالي': total,
-            'الخصم': discount,
-            'الصافي': netTotal,
             'العنوان': address,
             'رقم الهاتف': phone,
             'التاريخ': new Date().toLocaleString('ar-EG'),
             'عدد العناصر': items.reduce((sum, i) => sum + i.quantity, 0),
             'رقم الطلب': orderNumber,
-            'الحالة': 'جاري التنفيذ',
-            'ملاحظات': ''
+            'الحالة': 'جاري التنفيذ'
         });
         
-        return { success: true, orderNumber, netTotal };
+        return { success: true, orderNumber };
     } catch (error) {
         console.error('❌ خطأ في حفظ الطلب:', error);
         return { success: false, error: error.message };
     }
 }
 
-async function getUserOrders(userId, limit = 50) {
+async function getUserOrders(userId) {
     try {
         const doc = await getDoc();
         const sheet = doc.sheetsByTitle['Orders'];
@@ -240,20 +209,15 @@ async function getUserOrders(userId, limit = 50) {
         for (const row of rows) {
             if (row.get('ID') === userId.toString()) {
                 orders.push({
-                    text: row.get('الطلبات'),
+                    orderNumber: row.get('رقم الطلب') || '',
                     price: row.get('الإجمالي'),
-                    netPrice: row.get('الصافي') || row.get('الإجمالي'),
-                    discount: row.get('الخصم') || 0,
                     date: row.get('التاريخ'),
                     status: row.get('الحالة') || 'جاري التنفيذ',
-                    orderNumber: row.get('رقم الطلب') || '',
-                    itemsText: row.get('الطلبات'),
-                    address: row.get('العنوان'),
-                    phone: row.get('رقم الهاتف')
+                    itemsText: row.get('الطلبات')
                 });
             }
         }
-        return orders.reverse().slice(0, limit);
+        return orders.reverse();
     } catch (error) {
         console.error('❌ خطأ في جلب الطلبات:', error);
         return [];
@@ -274,13 +238,11 @@ async function getOrderByNumber(orderNumber) {
                     name: row.get('اسم العميل'),
                     text: row.get('الطلبات'),
                     price: row.get('الإجمالي'),
-                    netPrice: row.get('الصافي') || row.get('الإجمالي'),
-                    discount: row.get('الخصم') || 0,
                     address: row.get('العنوان'),
                     phone: row.get('رقم الهاتف'),
                     date: row.get('التاريخ'),
                     status: status,
-                    canEdit: status === 'جاري التنفيذ',
+                    canEdit: status === 'جاري التنفيذ',  // فقط "جاري التنفيذ" يمكن تعديله
                     row: row
                 };
             }
@@ -292,7 +254,7 @@ async function getOrderByNumber(orderNumber) {
     }
 }
 
-async function updateOrderStatus(orderNumber, newStatus, notes = '') {
+async function updateOrderStatus(orderNumber, newStatus) {
     try {
         const doc = await getDoc();
         const sheet = doc.sheetsByTitle['Orders'];
@@ -301,7 +263,6 @@ async function updateOrderStatus(orderNumber, newStatus, notes = '') {
         for (const row of rows) {
             if (row.get('رقم الطلب') === orderNumber) {
                 row.set('الحالة', newStatus);
-                if (notes) row.set('ملاحظات', notes);
                 await row.save();
                 return true;
             }
@@ -324,12 +285,15 @@ async function addItemsToOrder(orderNumber, newItems) {
                 const oldText = row.get('الطلبات');
                 const newItemsText = newItems.map(item => `${item.quantity} × ${item.name} (${item.price}ج)`).join('\n• ');
                 row.set('الطلبات', oldText + '\n• ' + newItemsText);
+                
                 const oldTotal = parseFloat(row.get('الإجمالي')) || 0;
                 const newTotal = newItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
                 row.set('الإجمالي', oldTotal + newTotal);
+                
                 const oldCount = parseInt(row.get('عدد العناصر')) || 0;
                 const newCount = newItems.reduce((sum, item) => sum + item.quantity, 0);
                 row.set('عدد العناصر', oldCount + newCount);
+                
                 await row.save();
                 return true;
             }
@@ -341,32 +305,10 @@ async function addItemsToOrder(orderNumber, newItems) {
     }
 }
 
-async function getAllCustomers() {
-    try {
-        const doc = await getDoc();
-        const sheet = doc.sheetsByTitle['Orders'];
-        if (!sheet) return [];
-        const rows = await sheet.getRows();
-        const customersMap = new Map();
-        for (const row of rows) {
-            const id = row.get('ID');
-            const name = row.get('اسم العميل');
-            const phone = row.get('رقم الهاتف');
-            if (id && name && !customersMap.has(id)) {
-                customersMap.set(id, { id, name, phone });
-            }
-        }
-        return Array.from(customersMap.values());
-    } catch (error) {
-        console.error('❌ خطأ في جلب العملاء:', error);
-        return [];
-    }
-}
-
 async function saveFeedback(userId, userName, rating, message, orderNumber = '') {
     try {
         const doc = await getDoc();
-        let sheet = doc.sheetsByTitle('Feedbakes');
+        let sheet = doc.sheetsByTitle['Feedbakes'];
         if (!sheet) {
             sheet = await doc.addSheet({
                 title: 'Feedbakes',
@@ -390,96 +332,26 @@ async function saveFeedback(userId, userName, rating, message, orderNumber = '')
     }
 }
 
-async function getSystemStats() {
-    const now = Date.now();
-    if (statsCache && (now - statsCacheTime) < CACHE_TTL) return statsCache;
-    
+async function getUserTotalSpent(userId) {
     try {
         const doc = await getDoc();
-        const ordersSheet = doc.sheetsByTitle['Orders'];
-        const feedbackSheet = doc.sheetsByTitle['Feedbakes'];
-        
-        let totalOrders = 0;
-        let totalRevenue = 0;
-        let pendingOrders = 0;
-        
-        if (ordersSheet) {
-            const rows = await ordersSheet.getRows();
-            totalOrders = rows.length;
-            for (const row of rows) {
-                totalRevenue += parseFloat(row.get('الصافي')) || parseFloat(row.get('الإجمالي')) || 0;
-                if (row.get('الحالة') === 'جاري التنفيذ') pendingOrders++;
+        const sheet = doc.sheetsByTitle['Orders'];
+        if (!sheet) return 0;
+        const rows = await sheet.getRows();
+        let total = 0;
+        for (const row of rows) {
+            if (row.get('ID') === userId.toString()) {
+                total += parseFloat(row.get('الإجمالي')) || 0;
             }
         }
-        
-        let avgRating = 0;
-        if (feedbackSheet) {
-            const rows = await feedbackSheet.getRows();
-            let totalRating = 0;
-            for (const row of rows) {
-                totalRating += parseInt(row.get('التقييم')) || 0;
-            }
-            avgRating = rows.length > 0 ? (totalRating / rows.length).toFixed(1) : 0;
-        }
-        
-        statsCache = { totalOrders, totalRevenue, pendingOrders, avgRating };
-        statsCacheTime = now;
-        return statsCache;
+        return total;
     } catch (error) {
-        console.error('❌ خطأ في جلب الإحصائيات:', error);
-        return { totalOrders: 0, totalRevenue: 0, pendingOrders: 0, avgRating: 0 };
+        return 0;
     }
 }
 
-// ============ دوال البث التلقائي للعروض ============
-function getOffersHash(offers) {
-    return JSON.stringify(offers.map(o => ({ text: o.text, date: o.date, code: o.code })));
-}
-
-async function broadcastOffersToAllCustomers() {
-    if (isBroadcasting) return;
-    try {
-        isBroadcasting = true;
-        const offers = await getOffers(true);
-        const currentHash = getOffersHash(offers);
-        if (currentHash === lastOffersHash || offers.length === 0) return;
-        
-        console.log('📢 بث العروض الجديدة...');
-        const customers = await getAllCustomers();
-        let sentCount = 0;
-        
-        for (const customer of customers) {
-            const customerKey = `${customer.id}_${currentHash}`;
-            if (offeredCustomers.has(customerKey)) continue;
-            try {
-                const message = `🎁 <b>عروض حصرية!</b> 🎁\n━━━━━━━━━━━━━━━\n\n` +
-                    offers.map(o => `✨ ${o.text}\n📅 ${o.date}${o.code ? `\n🏷️ كود: ${o.code}` : ''}`).join('\n━━━━━━━━━━━━━━━\n') +
-                    `\n\n⬇️ <b>اطلب الآن واستفد من العروض!</b>`;
-                await bot.telegram.sendMessage(customer.id, message, {
-                    parse_mode: 'HTML',
-                    ...Markup.inlineKeyboard([
-                        [Markup.button.callback('🛒 تصفح المنتجات', 'browse_products')],
-                        [Markup.button.callback('🎁 عرض العروض', 'view_offers')],
-                        [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
-                    ])
-                });
-                offeredCustomers.set(customerKey, true);
-                sentCount++;
-                await new Promise(r => setTimeout(r, 100));
-            } catch (err) { console.error(`فشل الإرسال للعميل ${customer.id}:`, err.message); }
-        }
-        console.log(`✅ تم بث العروض لـ ${sentCount} عميل`);
-        lastOffersHash = currentHash;
-        setTimeout(() => {
-            for (const key of offeredCustomers.keys()) {
-                if (key.includes(currentHash)) offeredCustomers.delete(key);
-            }
-        }, 24 * 60 * 60 * 1000);
-    } finally { isBroadcasting = false; }
-}
-
-// ============ دوال عرض المنتجات المتقدمة ============
-async function showProducts(ctx, page = 0, searchQuery = '', category = '') {
+// ============ عرض المنتجات ============
+async function showProducts(ctx, page = 0, searchQuery = '') {
     try {
         let products = await getProducts();
         if (products.length === 0) {
@@ -490,16 +362,11 @@ async function showProducts(ctx, page = 0, searchQuery = '', category = '') {
         }
         
         if (searchQuery) {
-            products = products.filter(p => p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                (p.description && p.description.toLowerCase().includes(searchQuery.toLowerCase())));
+            products = products.filter(p => p.name.toLowerCase().includes(searchQuery.toLowerCase()));
             if (products.length === 0) {
                 await ctx.reply(`🔍 لا توجد نتائج لـ "${searchQuery}"`);
                 return;
             }
-        }
-        
-        if (category && category !== 'all') {
-            products = products.filter(p => p.category === category);
         }
         
         currentProducts = products;
@@ -539,6 +406,7 @@ async function showProducts(ctx, page = 0, searchQuery = '', category = '') {
     }
 }
 
+// ============ عرض السلة ============
 async function showCart(ctx) {
     const userId = ctx.from.id;
     let cart = carts.get(userId) || [];
@@ -553,14 +421,14 @@ async function showCart(ctx) {
         return;
     }
     
-    let subtotal = 0;
+    let total = 0;
     let msg = '🛍️ <b>سلة المشتريات</b>\n━━━━━━━━━━━━━━━\n\n';
     const buttons = [];
     
     for (let i = 0; i < cart.length; i++) {
         const item = cart[i];
-        subtotal += item.total;
-        msg += `${i+1}. ${item.display}\n`;
+        total += item.total;
+        msg += `${i+1}. ${item.name}: ${item.quantity} × ${item.price} = ${item.total} ج\n`;
         buttons.push([
             Markup.button.callback('➕', `inc_${i}`),
             Markup.button.callback(`${item.quantity}`, 'noop'),
@@ -568,27 +436,9 @@ async function showCart(ctx) {
             Markup.button.callback('❌', `rem_${i}`)
         ]);
     }
-    
-    const delivery = subtotal >= FREE_DELIVERY_AMOUNT ? 0 : DELIVERY_FEE;
-    const total = subtotal + delivery;
-    const session = sessions.get(userId);
-    const tier = session ? session.getTier() : { discount: 0 };
-    const tierDiscount = Math.floor(subtotal * tier.discount / 100);
-    const finalTotal = total - tierDiscount;
-    
-    msg += `\n━━━━━━━━━━━━━━━\n`;
-    msg += `💰 <b>المجموع:</b> ${subtotal} ج\n`;
-    if (delivery > 0) msg += `🚚 <b>التوصيل:</b> ${delivery} ج\n`;
-    if (tierDiscount > 0) msg += `🎖️ <b>خصم ${tier.discount}%:</b> -${tierDiscount} ج\n`;
-    msg += `━━━━━━━━━━━━━━━\n`;
-    msg += `💎 <b>الإجمالي:</b> ${finalTotal} ج\n`;
-    
-    if (subtotal >= FREE_DELIVERY_AMOUNT) {
-        msg += `\n🎉 <b>التوصيل مجاني!</b>`;
-    }
+    msg += `\n━━━━━━━━━━━━━━━\n💰 <b>الإجمالي:</b> ${total} ج`;
     
     buttons.push([Markup.button.callback('➕ إضافة منتجات', 'browse_products')]);
-    buttons.push([Markup.button.callback('🎟️ كود خصم', 'apply_coupon')]);
     buttons.push([Markup.button.callback('✅ تأكيد الطلب', 'checkout')]);
     buttons.push([Markup.button.callback('🗑️ تفريغ السلة', 'clear_cart')]);
     buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
@@ -596,9 +446,10 @@ async function showCart(ctx) {
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 }
 
+// ============ عرض الطلبات ============
 async function showOrders(ctx) {
     const userId = ctx.from.id;
-    const orders = await getUserOrders(userId, MAX_ORDERS_DISPLAY);
+    const orders = await getUserOrders(userId);
     
     if (orders.length === 0) {
         await ctx.reply('📭 لا يوجد طلبات سابقة', {
@@ -613,17 +464,16 @@ async function showOrders(ctx) {
     let msg = '📋 <b>طلباتي</b>\n━━━━━━━━━━━━━━━\n\n';
     const buttons = [];
     
-    for (let i = 0; i < orders.length; i++) {
+    for (let i = 0; i < Math.min(orders.length, 10); i++) {
         const order = orders[i];
         let icon = order.status === 'تم التسليم' ? '✅' : order.status === 'في الطريق' ? '🚚' : order.status === 'ملغي' ? '❌' : '🟡';
-        let statusText = order.status === 'جاري التنفيذ' ? 'جاري التحضير' : order.status;
         
         msg += `${i+1}. ${icon} <b>${order.date}</b>\n`;
         msg += `   🏷️ ${order.orderNumber}\n`;
-        msg += `   💰 ${order.netPrice} ج\n`;
-        msg += `   📍 ${statusText}\n`;
+        msg += `   💰 ${order.price} ج\n`;
+        msg += `   📍 ${order.status}\n`;
         msg += `━━━━━━━━━━━━━━━\n\n`;
-        buttons.push([Markup.button.callback(`🔍 تتبع ${order.orderNumber.slice(-8)}`, `track_${order.orderNumber}`)]);
+        buttons.push([Markup.button.callback(`🔍 تتبع الطلب`, `track_${order.orderNumber}`)]);
     }
     
     buttons.push([Markup.button.callback('📊 إحصائياتي', 'my_stats')]);
@@ -632,6 +482,7 @@ async function showOrders(ctx) {
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 }
 
+// ============ عرض العروض ============
 async function showOffers(ctx) {
     const offers = await getOffers();
     if (offers.length === 0) {
@@ -646,10 +497,7 @@ async function showOffers(ctx) {
     
     let msg = '🎁 <b>عروض بوب مارت</b>\n━━━━━━━━━━━━━━━\n\n';
     for (const offer of offers) {
-        msg += `✨ ${offer.text}\n📅 ${offer.date}\n`;
-        if (offer.code) msg += `🏷️ <b>كود:</b> ${offer.code}\n`;
-        if (offer.discount > 0) msg += `💰 <b>خصم:</b> ${offer.discount}%\n`;
-        msg += `━━━━━━━━━━━━━━━\n`;
+        msg += `✨ ${offer.text}\n📅 ${offer.date}\n━━━━━━━━━━━━━━━\n`;
     }
     
     await ctx.reply(msg, {
@@ -661,36 +509,7 @@ async function showOffers(ctx) {
     });
 }
 
-async function showStats(ctx) {
-    const userId = ctx.from.id;
-    const orders = await getUserOrders(userId, 100);
-    const session = sessions.get(userId) || new UserSession(userId);
-    const tier = session.getTier();
-    
-    const total = orders.reduce((sum, o) => sum + (parseFloat(o.netPrice) || 0), 0);
-    const pending = orders.filter(o => o.status === 'جاري التنفيذ').length;
-    const completed = orders.filter(o => o.status === 'تم التسليم').length;
-    
-    const msg = `📊 <b>إحصائياتي</b>\n━━━━━━━━━━━━━━━\n\n` +
-        `👤 <b>الاسم:</b> ${session.name || 'غير مسجل'}\n` +
-        `🏆 <b>المستوى:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
-        `📦 <b>عدد الطلبات:</b> ${orders.length}\n` +
-        `✅ <b>تم التسليم:</b> ${completed}\n` +
-        `🔄 <b>قيد التنفيذ:</b> ${pending}\n` +
-        `💰 <b>إجمالي المشتريات:</b> ${total} ج\n` +
-        `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
-        `🎯 <b>للوصول للمستوى التالي:</b> ${tier.name === '💎 بلاتينيوم' ? 'أنت في أعلى مستوى!' : `أنفق ${500 - total > 0 ? 500 - total : 0} ج أخرى`}`;
-    
-    await ctx.reply(msg, {
-        parse_mode: 'HTML',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('📋 طلباتي', 'my_orders')],
-            [Markup.button.callback('⭐ تقييم الخدمة', 'feedback')],
-            [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
-        ])
-    });
-}
-
+// ============ تتبع الطلب (مع التحكم في أزرار التعديل حسب الحالة) ============
 async function trackOrder(ctx, orderNumber) {
     if (!orderNumber || orderNumber.length < 10) {
         await ctx.reply('❌ رقم الطلب غير صحيح\n\nالرجاء إرسال رقم صحيح (مثال: ORD-1734567890123-7573)');
@@ -703,94 +522,99 @@ async function trackOrder(ctx, orderNumber) {
         return;
     }
     
-    let icon = '🟡', statusText = '', progress = 0;
+    let icon = '🟡', statusText = '';
     if (order.status === 'جاري التنفيذ') {
-        icon = '🟡'; statusText = '✅ جاري تجهيز طلبك'; progress = 25;
+        icon = '🟡';
+        statusText = '✅ جاري تجهيز طلبك - يمكنك تعديل أو إلغاء الطلب';
     } else if (order.status === 'تم التجهيز') {
-        icon = '📦'; statusText = 'طلبك جاهز للتوصيل'; progress = 50;
+        icon = '📦';
+        statusText = 'طلبك جاهز للتوصيل - لا يمكن التعديل الآن';
     } else if (order.status === 'في الطريق') {
-        icon = '🚚'; statusText = 'مندوب التوصيل في طريقه إليك'; progress = 75;
+        icon = '🚚';
+        statusText = 'مندوب التوصيل في طريقه إليك - لا يمكن التعديل';
     } else if (order.status === 'تم التسليم') {
-        icon = '✅'; statusText = 'تم توصيل طلبك بنجاح'; progress = 100;
+        icon = '✅';
+        statusText = 'تم توصيل طلبك بنجاح - شكراً لتسوقك معنا';
     } else if (order.status === 'ملغي') {
-        icon = '❌'; statusText = 'تم إلغاء الطلب'; progress = 0;
+        icon = '❌';
+        statusText = 'تم إلغاء الطلب';
     }
-    
-    const progressBar = '█'.repeat(Math.floor(progress / 10)) + '░'.repeat(10 - Math.floor(progress / 10));
     
     let msg = `📦 <b>تتبع الطلب</b>\n━━━━━━━━━━━━━━━\n\n`;
     msg += `🏷️ <b>رقم الطلب:</b> ${order.orderNumber}\n`;
     msg += `${icon} <b>الحالة:</b> ${order.status}\n`;
-    msg += `📝 ${statusText}\n`;
-    msg += `📊 التقدم: ${progressBar} ${progress}%\n\n`;
+    msg += `📝 ${statusText}\n\n`;
     msg += `👤 <b>العميل:</b> ${order.name}\n`;
-    msg += `💰 <b>الإجمالي:</b> ${order.netPrice} ج\n`;
-    if (order.discount > 0) msg += `🎖️ <b>الخصم:</b> ${order.discount} ج\n`;
+    msg += `💰 <b>الإجمالي:</b> ${order.price} ج\n`;
     msg += `📍 <b>العنوان:</b> ${order.address}\n`;
     msg += `📅 <b>التاريخ:</b> ${order.date}\n`;
     msg += `━━━━━━━━━━━━━━━\n\n`;
     msg += `📦 <b>المنتجات:</b>\n${order.text}`;
     
-    const buttons = [[Markup.button.callback('🏠 الرئيسية', 'main_menu')]];
-    if (order.status === 'تم التسليم') {
-        buttons.unshift([Markup.button.callback('⭐ تقييم الطلب', `rate_order_${order.orderNumber}`)]);
+    const buttons = [];
+    
+    // ✅ فقط إذا كانت الحالة "جاري التنفيذ" تظهر أزرار التعديل والإلغاء
+    if (order.canEdit) {
+        buttons.push([Markup.button.callback('✏️ تعديل الطلب', `edit_order_${order.orderNumber}`)]);
+        buttons.push([Markup.button.callback('❌ إلغاء الطلب', `cancel_order_${order.orderNumber}`)]);
     }
+    
+    // ✅ إذا كانت الحالة "تم التسليم" تظهر زر التقييم
+    if (order.status === 'تم التسليم') {
+        buttons.push([Markup.button.callback('⭐ تقييم الطلب', `rate_order_${order.orderNumber}`)]);
+    }
+    
+    buttons.push([Markup.button.callback('📋 كل طلباتي', 'my_orders')]);
+    buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
     
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 }
 
-async function startCheckout(ctx) {
+// ============ عرض إحصائيات المستخدم ============
+async function showStats(ctx) {
     const userId = ctx.from.id;
-    let cart = carts.get(userId) || [];
-    
-    if (cart.length === 0) {
-        await ctx.reply('🛍️ سلتك فارغة');
-        return;
-    }
-    
-    if (cart.length > MAX_CART_ITEMS) {
-        await ctx.reply(`❌ لا يمكنك طلب أكثر من ${MAX_CART_ITEMS} منتج في المرة الواحدة`);
-        return;
-    }
-    
+    const orders = await getUserOrders(userId);
     const session = sessions.get(userId) || new UserSession(userId);
-    session.status = 'ordering_name';
+    
+    // حساب إجمالي المشتريات من قاعدة البيانات
+    const totalSpent = await getUserTotalSpent(userId);
+    session.totalSpent = totalSpent;
     sessions.set(userId, session);
     
-    let subtotal = cart.reduce((sum, item) => sum + item.total, 0);
-    const delivery = subtotal >= FREE_DELIVERY_AMOUNT ? 0 : DELIVERY_FEE;
     const tier = session.getTier();
-    const discount = Math.floor(subtotal * tier.discount / 100);
-    const total = subtotal + delivery - discount;
+    const pending = orders.filter(o => o.status === 'جاري التنفيذ').length;
+    const completed = orders.filter(o => o.status === 'تم التسليم').length;
     
-    const cartItems = cart.map((item, i) => `${i+1}. ${item.display}`).join('\n');
+    let nextTierText = '';
+    if (tier.name === '🟣 جديد') nextTierText = `\n🎯 أنفق ${100 - totalSpent} ج أخرى للوصول إلى مستوى برونزي`;
+    else if (tier.name === '🟤 برونزي') nextTierText = `\n🎯 أنفق ${500 - totalSpent} ج أخرى للوصول إلى مستوى فضي`;
+    else if (tier.name === '⭐ فضي') nextTierText = `\n🎯 أنفق ${2000 - totalSpent} ج أخرى للوصول إلى مستوى ذهبي`;
+    else if (tier.name === '🌟 ذهبي') nextTierText = `\n🎯 أنفق ${5000 - totalSpent} ج أخرى للوصول إلى مستوى بلاتينيوم`;
+    else nextTierText = `\n🏆 أنت في أعلى مستوى!`;
     
-    await ctx.reply(`🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n${cartItems}\n\n` +
-        `💰 المجموع: ${subtotal} ج\n` +
-        (delivery > 0 ? `🚚 التوصيل: ${delivery} ج\n` : `🎉 توصيل مجاني!\n`) +
-        (discount > 0 ? `🎖️ خصم ${tier.discount}%: -${discount} ج\n` : '') +
-        `━━━━━━━━━━━━━━━\n` +
-        `💎 <b>الإجمالي:</b> ${total} ج\n\n` +
-        `📝 أرسل اسمك الكامل:`, { parse_mode: 'HTML' });
+    const msg = `📊 <b>إحصائياتي</b>\n━━━━━━━━━━━━━━━\n\n` +
+        `👤 <b>الاسم:</b> ${session.name || 'غير مسجل'}\n` +
+        `🏆 <b>المستوى:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
+        `📦 <b>عدد الطلبات:</b> ${orders.length}\n` +
+        `✅ <b>تم التسليم:</b> ${completed}\n` +
+        `🔄 <b>قيد التنفيذ:</b> ${pending}\n` +
+        `💰 <b>إجمالي المشتريات:</b> ${totalSpent} ج\n` +
+        `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
+        `${nextTierText}\n\n` +
+        `💡 <b>ملاحظة:</b> كل 10 ج = 1 نقطة ولاء\n` +
+        `كلما زادت مشترياتك، ارتفع مستواك وزاد الخصم!`;
+    
+    await ctx.reply(msg, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('📋 طلباتي', 'my_orders')],
+            [Markup.button.callback('⭐ تقييم الخدمة', 'feedback')],
+            [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+        ])
+    });
 }
 
-async function applyCoupon(ctx, code) {
-    const offers = await getOffers();
-    const offer = offers.find(o => o.code && o.code.toLowerCase() === code.toLowerCase());
-    if (!offer) {
-        await ctx.reply('❌ كود الخصم غير صالح');
-        return false;
-    }
-    const session = sessions.get(ctx.from.id);
-    if (session) {
-        session.tempDiscount = offer.discount;
-        sessions.set(ctx.from.id, session);
-        await ctx.reply(`✅ تم تطبيق خصم ${offer.discount}% باستخدام الكود: ${code}`);
-        return true;
-    }
-    return false;
-}
-
+// ============ التقييم ============
 async function showFeedbackButtons(ctx, orderNumber = '') {
     const suffix = orderNumber ? `_${orderNumber}` : '';
     await ctx.reply(
@@ -806,7 +630,183 @@ async function showFeedbackButtons(ctx, orderNumber = '') {
     );
 }
 
-// ============ القوائم الرئيسية ============
+// ============ تعديل الطلب ============
+async function handleEditOrder(ctx, orderNumber) {
+    const order = await getOrderByNumber(orderNumber);
+    
+    if (!order || !order.canEdit) {
+        await ctx.reply('❌ لا يمكن تعديل هذا الطلب حالياً لأنه لا يزال قيد التنفيذ أو تم إلغاؤه');
+        return;
+    }
+    
+    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
+    session.status = 'editing';
+    session.editingOrder = orderNumber;
+    session.editCart = [];
+    sessions.set(ctx.from.id, session);
+    
+    await ctx.reply(`✏️ <b>تعديل الطلب #${orderNumber}</b>\n\n` +
+        `📦 المنتجات الحالية:\n${order.text}\n\n` +
+        `➕ أضف منتجات جديدة بالضغط على "🛒 المنتجات"\n` +
+        `المنتجات الجديدة ستضاف إلى الطلب الحالي\n\n` +
+        `بعد الانتهاء، اضغط "إنهاء التعديل"`,
+        {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🛒 المنتجات', 'browse_products')],
+                [Markup.button.callback('✅ إنهاء التعديل', 'finish_edit')],
+                [Markup.button.callback('❌ إلغاء', 'cancel_edit')],
+                [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+            ])
+        }
+    );
+}
+
+async function finishEdit(ctx) {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    
+    if (!session || !session.editingOrder || session.status !== 'editing') {
+        await ctx.reply('❌ لا يوجد تعديل نشط');
+        return;
+    }
+    
+    if (session.editCart.length === 0) {
+        await ctx.reply('⚠️ لم تقم بإضافة أي منتجات جديدة\n\nلإضافة منتجات، اضغط على "🛒 المنتجات" ثم اختر المنتجات');
+        return;
+    }
+    
+    const success = await addItemsToOrder(session.editingOrder, session.editCart);
+    
+    if (success) {
+        const addedItems = session.editCart.map(item => `${item.quantity} × ${item.name}`).join(', ');
+        const orderNum = session.editingOrder;
+        session.editCart = [];
+        session.status = 'main';
+        session.editingOrder = null;
+        sessions.set(userId, session);
+        
+        await ctx.reply(`✅ تم تعديل الطلب #${orderNum} بنجاح!\n\n📦 تم إضافة: ${addedItems}`, {
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNum}`)]])
+        });
+    } else {
+        await ctx.reply('❌ حدث خطأ في تعديل الطلب');
+    }
+}
+
+async function cancelEdit(ctx) {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    
+    if (session) {
+        session.status = 'main';
+        session.editingOrder = null;
+        session.editCart = [];
+        sessions.set(userId, session);
+    }
+    
+    await ctx.reply('❌ تم إلغاء التعديل', {
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
+    });
+}
+
+// ============ إلغاء الطلب ============
+async function handleCancelOrder(ctx, orderNumber) {
+    const order = await getOrderByNumber(orderNumber);
+    
+    if (!order || !order.canEdit) {
+        await ctx.reply('❌ لا يمكن إلغاء هذا الطلب حالياً لأنه لا يزال قيد التنفيذ أو تم إلغاؤه');
+        return;
+    }
+    
+    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
+    session.tempOrderNumber = orderNumber;
+    sessions.set(ctx.from.id, session);
+    
+    await ctx.reply(`⚠️ <b>تأكيد إلغاء الطلب</b>\n\n` +
+        `🏷️ ${order.orderNumber}\n` +
+        `💰 ${order.price} ج\n\n` +
+        `هل أنت متأكد من إلغاء هذا الطلب؟ لا يمكن التراجع!`,
+        {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('✅ نعم، ألغي', 'confirm_cancel')],
+                [Markup.button.callback('❌ لا، عودة', `track_${orderNumber}`)]
+            ])
+        }
+    );
+}
+
+async function confirmCancel(ctx) {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    
+    if (!session || !session.tempOrderNumber) {
+        await ctx.reply('❌ حدث خطأ');
+        return;
+    }
+    
+    const success = await updateOrderStatus(session.tempOrderNumber, 'ملغي');
+    
+    if (success) {
+        await ctx.reply(`✅ تم إلغاء الطلب #${session.tempOrderNumber} بنجاح`, {
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('🛒 طلب جديد', 'browse_products')],
+                [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+            ])
+        });
+    } else {
+        await ctx.reply('❌ لا يمكن إلغاء هذا الطلب الآن');
+    }
+    
+    session.tempOrderNumber = null;
+    sessions.set(userId, session);
+}
+
+// ============ معالج الطلب ============
+async function startCheckout(ctx) {
+    const userId = ctx.from.id;
+    let cart = carts.get(userId) || [];
+    
+    if (cart.length === 0) {
+        await ctx.reply('🛍️ سلتك فارغة');
+        return;
+    }
+    
+    const total = cart.reduce((sum, item) => sum + item.total, 0);
+    const session = sessions.get(userId) || new UserSession(userId);
+    session.status = 'ordering_name';
+    sessions.set(userId, session);
+    
+    const cartItems = cart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n');
+    
+    await ctx.reply(`🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n${cartItems}\n\n💰 <b>الإجمالي:</b> ${total} ج\n━━━━━━━━━━━━━━━\n\n📝 أرسل اسمك الكامل:`, { parse_mode: 'HTML' });
+}
+
+// ============ البحث والتتبع ============
+async function handleSearch(ctx) {
+    await ctx.reply('🔍 اكتب اسم المنتج:', {
+        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
+    });
+    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
+    session.status = 'searching';
+    sessions.set(ctx.from.id, session);
+}
+
+async function handleTrack(ctx) {
+    await ctx.reply('🔍 <b>تتبع الطلب</b>\n\n✏️ أرسل رقم الطلب (مثال: ORD-1734567890123-7573):\n\n📌 يمكنك نسخ الرقم من رسالة تأكيد الطلب', {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('📋 طلباتي', 'my_orders')],
+            [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+        ])
+    });
+    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
+    session.status = 'tracking';
+    sessions.set(ctx.from.id, session);
+}
+
+// ============ القائمة الرئيسية ============
 const mainKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 المنتجات', 'browse_products')],
     [Markup.button.callback('🛍️ السلة', 'view_cart')],
@@ -816,12 +816,6 @@ const mainKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('📊 إحصائياتي', 'my_stats')],
     [Markup.button.callback('⭐ تقييم', 'feedback')],
     [Markup.button.callback('📞 الدعم', 'support')]
-]);
-
-const adminKeyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('📊 إحصائيات النظام', 'admin_stats')],
-    [Markup.button.callback('📢 بث رسالة', 'admin_broadcast')],
-    [Markup.button.callback('🔄 تحديث الكاش', 'admin_refresh')]
 ]);
 
 // ============ معالج الأزرار ============
@@ -835,9 +829,13 @@ bot.start(async (ctx) => {
     }
     if (!carts.has(userId)) carts.set(userId, []);
     
+    // جلب إجمالي المشتريات من قاعدة البيانات
+    session.totalSpent = await getUserTotalSpent(userId);
+    const tier = session.getTier();
+    
     const welcomeMsg = `🌟 <b>مرحباً بك في بوب مارت!</b> 🌟\n━━━━━━━━━━━━━━━\n\n` +
         `👤 <b>الاسم:</b> ${ctx.from.first_name}\n` +
-        `🏆 <b>المستوى:</b> ${session.getTier().name}\n\n` +
+        `🏆 <b>مستواك:</b> ${tier.name} (خصم ${tier.discount}%)\n\n` +
         `🛒 أكبر سوبر ماركت في العالم!\n` +
         `✅ توصيل سريع - أسعار تنافسية - جودة عالية\n━━━━━━━━━━━━━━━\n\n` +
         `📌 اختر من القائمة:`;
@@ -877,13 +875,7 @@ bot.action('my_stats', async (ctx) => {
 
 bot.action('track_order', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await ctx.reply('🔍 <b>تتبع الطلب</b>\n\n✏️ أرسل رقم الطلب:', {
-        parse_mode: 'HTML',
-        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
-    });
-    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
-    session.status = 'tracking';
-    sessions.set(ctx.from.id, session);
+    await handleTrack(ctx);
 });
 
 bot.action('feedback', async (ctx) => {
@@ -895,34 +887,15 @@ bot.action('support', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     await ctx.reply('📞 <b>الدعم الفني</b>\n━━━━━━━━━━━━━━━\n\n' +
         '📱 واتساب: <code>01020063819</code>\n' +
-        '✈️ تليجرام: @Muhamedhosny\n' +
-        '📧 إيميل: support@bobmart.com\n\n' +
-        '⏰ أوقات العمل: 9 ص - 9 م\n━━━━━━━━━━━━━━━\n\n' +
-        '⚡ <b>للشكاوي والاقتراحات:</b> اضغط على زر التقييم', {
-        parse_mode: 'HTML',
-        ...Markup.inlineKeyboard([[Markup.button.callback('⭐ تقييم الخدمة', 'feedback')]])
+        '✈️ تليجرام: @Muhamedhosny\n\n' +
+        '⏰ أوقات العمل: 9 ص - 9 م', {
+        parse_mode: 'HTML'
     });
 });
 
 bot.action('search_products', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await ctx.reply('🔍 اكتب اسم المنتج:', {
-        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
-    });
-    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
-    session.status = 'searching';
-    sessions.set(ctx.from.id, session);
-});
-
-bot.action('apply_coupon', async (ctx) => {
-    await ctx.answerCbQuery().catch(() => {});
-    await ctx.reply('🎟️ <b>إدخال كود الخصم</b>\n\n✏️ أرسل الكود:', {
-        parse_mode: 'HTML',
-        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
-    });
-    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
-    session.status = 'applying_coupon';
-    sessions.set(ctx.from.id, session);
+    await handleSearch(ctx);
 });
 
 bot.action('next_page', async (ctx) => {
@@ -1001,21 +974,26 @@ bot.action(/add_(.+)_(.+)/, async (ctx) => {
     
     await ctx.answerCbQuery(`✅ تم إضافة ${productName}`).catch(() => {});
     
+    // ✅ التحقق: إذا كان المستخدم في وضع تعديل الطلب
     if (session && session.status === 'editing') {
         const existing = session.editCart.find(item => item.name === productName);
-        if (existing) existing.quantity++;
-        else session.editCart.push({ name: productName, price: productPrice, quantity: 1 });
-        sessions.set(userId, session);
-        await ctx.reply(`✅ تم إضافة ${productName} للتعديل\n📦 المنتجات المضافة: ${session.editCart.map(i => `${i.quantity}×${i.name}`).join(', ')}`);
-    } else {
-        let cart = carts.get(userId) || [];
-        if (cart.length >= MAX_CART_ITEMS) {
-            await ctx.reply(`❌ لا يمكنك إضافة أكثر من ${MAX_CART_ITEMS} منتج`);
-            return;
+        if (existing) {
+            existing.quantity++;
+        } else {
+            session.editCart.push({ name: productName, price: productPrice, quantity: 1 });
         }
+        sessions.set(userId, session);
+        await ctx.reply(`✅ تم إضافة ${productName} إلى تعديل الطلب\n\n📦 المنتجات المضافة حالياً: ${session.editCart.map(i => `${i.quantity}×${i.name}`).join(', ')}`);
+    } 
+    // ✅ الوضع العادي: إضافة إلى السلة
+    else {
+        let cart = carts.get(userId) || [];
         const existing = cart.find(item => item.name === productName);
-        if (existing) existing.quantity++;
-        else cart.push(new CartItem(productName, productPrice, 1));
+        if (existing) {
+            existing.quantity++;
+        } else {
+            cart.push(new CartItem(productName, productPrice, 1));
+        }
         carts.set(userId, cart);
         await ctx.reply(`✅ تم إضافة ${productName} إلى السلة\n🛍️ عدد المنتجات في السلة: ${cart.length}`);
     }
@@ -1023,6 +1001,34 @@ bot.action(/add_(.+)_(.+)/, async (ctx) => {
 
 bot.action('noop', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
+});
+
+// أزرار التعديل والإلغاء
+bot.action(/edit_order_(.+)/, async (ctx) => {
+    const orderNumber = ctx.match[1];
+    await ctx.answerCbQuery().catch(() => {});
+    await handleEditOrder(ctx, orderNumber);
+});
+
+bot.action(/cancel_order_(.+)/, async (ctx) => {
+    const orderNumber = ctx.match[1];
+    await ctx.answerCbQuery().catch(() => {});
+    await handleCancelOrder(ctx, orderNumber);
+});
+
+bot.action('finish_edit', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await finishEdit(ctx);
+});
+
+bot.action('cancel_edit', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await cancelEdit(ctx);
+});
+
+bot.action('confirm_cancel', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await confirmCancel(ctx);
 });
 
 // أزرار التقييم
@@ -1034,20 +1040,26 @@ for (let i = 1; i <= 5; i++) {
         const session = sessions.get(userId) || new UserSession(userId);
         
         await ctx.answerCbQuery(`✅ شكراً لتقييمك ${rating} نجوم!`).catch(() => {});
-        await saveFeedback(userId, session.name || ctx.from.first_name, rating, '', orderNumber);
         
-        await ctx.reply(
-            `🙏 <b>شكراً لتقييمك ${'⭐'.repeat(rating)}</b>\n\n` +
-            `تقييمك مهم جداً لتطوير خدماتنا.\n` +
-            `هل تريد إضافة ملاحظات إضافية؟`,
-            {
-                parse_mode: 'HTML',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('📝 إضافة ملاحظة', `add_note_${orderNumber}_${rating}`)],
-                    [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
-                ])
-            }
-        );
+        // ✅ حفظ التقييم في Google Sheets
+        const saved = await saveFeedback(userId, session.name || ctx.from.first_name, rating, '', orderNumber);
+        
+        if (saved) {
+            await ctx.reply(
+                `🙏 <b>شكراً لتقييمك ${'⭐'.repeat(rating)}</b>\n\n` +
+                `تقييمك مهم جداً لتطوير خدماتنا.\n` +
+                `هل تريد إضافة ملاحظات إضافية؟`,
+                {
+                    parse_mode: 'HTML',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('📝 إضافة ملاحظة', `add_note_${orderNumber}_${rating}`)],
+                        [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+                    ])
+                }
+            );
+        } else {
+            await ctx.reply('❌ حدث خطأ في حفظ التقييم، حاول مرة أخرى');
+        }
     });
 }
 
@@ -1055,48 +1067,24 @@ bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     const rating = ctx.match[2];
     await ctx.answerCbQuery().catch(() => {});
+    
     const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
     session.status = 'feedback_note';
     session.pendingRating = { orderNumber, rating };
     sessions.set(ctx.from.id, session);
-    await ctx.reply('📝 <b>أضف ملاحظاتك</b>\n\n✏️ اكتب ملاحظاتك أو اقتراحاتك:');
+    
+    await ctx.reply('📝 <b>أضف ملاحظاتك</b>\n\n✏️ اكتب ملاحظاتك أو اقتراحاتك هنا:');
 });
 
 bot.action(/rate_order_(.+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     await ctx.answerCbQuery().catch(() => {});
+    
     const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
     session.pendingRating = orderNumber;
     sessions.set(ctx.from.id, session);
+    
     await showFeedbackButtons(ctx, orderNumber);
-});
-
-// أوامر الأدمن
-bot.action('admin_stats', async (ctx) => {
-    if (ctx.from.id.toString() !== ADMIN_ID) return;
-    const stats = await getSystemStats();
-    await ctx.reply(`📊 <b>إحصائيات النظام</b>\n━━━━━━━━━━━━━━━\n\n` +
-        `📦 إجمالي الطلبات: ${stats.totalOrders}\n` +
-        `💰 إجمالي الإيرادات: ${stats.totalRevenue} ج\n` +
-        `🔄 طلبات قيد التنفيذ: ${stats.pendingOrders}\n` +
-        `⭐ متوسط التقييم: ${stats.avgRating}/5\n` +
-        `👥 عدد الجلسات النشطة: ${sessions.size}\n` +
-        `🛍️ عدد السلات النشطة: ${carts.size}`, { parse_mode: 'HTML' });
-});
-
-bot.action('admin_broadcast', async (ctx) => {
-    if (ctx.from.id.toString() !== ADMIN_ID) return;
-    const session = sessions.get(ctx.from.id);
-    session.status = 'broadcast';
-    sessions.set(ctx.from.id, session);
-    await ctx.reply('📢 أرسل الرسالة التي تريد بثها لجميع العملاء:');
-});
-
-bot.action('admin_refresh', async (ctx) => {
-    if (ctx.from.id.toString() !== ADMIN_ID) return;
-    await getProducts(true);
-    await getOffers(true);
-    await ctx.reply('✅ تم تحديث الكاش بنجاح');
 });
 
 // ============ معالج النصوص ============
@@ -1115,40 +1103,18 @@ bot.on('text', async (ctx) => {
     if (lastMessage && Date.now() - lastMessage < 1000) return;
     userCooldowns.set(userId, Date.now());
     
-    // أوامر الأدمن
-    if (text === '/admin' && ctx.from.id.toString() === ADMIN_ID) {
-        await ctx.reply('🔐 لوحة تحكم الأدمن', { ...adminKeyboard });
-        return;
-    }
-    
-    // ملاحظات التقييم
+    // ✅ ملاحظات التقييم (هذا أولوية عالية)
     if (session.status === 'feedback_note' && session.pendingRating) {
         const { orderNumber, rating } = session.pendingRating;
         await saveFeedback(userId, session.name || ctx.from.first_name, parseInt(rating), text, orderNumber);
         session.status = 'main';
         session.pendingRating = null;
         sessions.set(userId, session);
+        
         await ctx.reply('🙏 <b>شكراً لملاحظاتك!</b>\n\nتم استلام ملاحظاتك وسنعمل على تحسين خدماتنا.', {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
         });
-        return;
-    }
-    
-    // بث رسالة للأدمن
-    if (session.status === 'broadcast' && ctx.from.id.toString() === ADMIN_ID) {
-        const customers = await getAllCustomers();
-        let sent = 0;
-        for (const customer of customers) {
-            try {
-                await bot.telegram.sendMessage(customer.id, `📢 <b>إعلان من بوب مارت</b>\n━━━━━━━━━━━━━━━\n\n${text}`, { parse_mode: 'HTML' });
-                sent++;
-                await new Promise(r => setTimeout(r, 50));
-            } catch (err) { console.error(err); }
-        }
-        session.status = 'main';
-        sessions.set(userId, session);
-        await ctx.reply(`✅ تم إرسال الرسالة لـ ${sent} عميل`);
         return;
     }
     
@@ -1165,15 +1131,6 @@ bot.on('text', async (ctx) => {
         session.status = 'main';
         sessions.set(userId, session);
         await showProducts(ctx, 0, text);
-        return;
-    }
-    
-    // تطبيق كود خصم
-    if (session.status === 'applying_coupon') {
-        session.status = 'main';
-        sessions.set(userId, session);
-        await applyCoupon(ctx, text);
-        await showCart(ctx);
         return;
     }
     
@@ -1213,19 +1170,18 @@ bot.on('text', async (ctx) => {
         
         session.phone = phoneMatch[0];
         const cart = carts.get(userId) || [];
-        let subtotal = cart.reduce((sum, item) => sum + item.total, 0);
-        const delivery = subtotal >= FREE_DELIVERY_AMOUNT ? 0 : DELIVERY_FEE;
-        const tier = session.getTier();
-        const discount = Math.floor(subtotal * tier.discount / 100);
-        const total = subtotal + delivery - discount;
+        const total = cart.reduce((sum, item) => sum + item.total, 0);
         
-        const saved = await saveOrder(userId, session.name, session.address, session.phone, cart, subtotal, discount, total);
+        const saved = await saveOrder(userId, session.name, session.address, session.phone, cart, total);
         
         if (saved.success) {
+            // تحديث إجمالي المشتريات ونقاط الولاء
+            session.totalSpent += total;
+            const pointsEarned = session.addLoyaltyPoints(total);
+            const tier = session.getTier();
+            
             carts.set(userId, []);
             session.status = 'main';
-            session.addLoyaltyPoints(total);
-            session.totalSpent += total;
             sessions.set(userId, session);
             
             const successMessage = 
@@ -1236,12 +1192,11 @@ bot.on('text', async (ctx) => {
 
 👤 <b>الاسم:</b> ${session.name}
 💰 <b>الإجمالي:</b> ${total} ج
-${discount > 0 ? `🎖️ <b>الخصم:</b> ${discount} ج\n` : ''}
 📍 <b>العنوان:</b> ${session.address}
 📞 <b>الهاتف:</b> ${session.phone}
 
-✨ <b>حصلت على ${Math.floor(total / 10)} نقطة ولاء</b>
-🏆 <b>مستواك الحالي:</b> ${tier.name}
+✨ <b>حصلت على ${pointsEarned} نقطة ولاء</b>
+🏆 <b>مستواك الحالي:</b> ${tier.name} (خصم ${tier.discount}%)
 
 📌 <b>لتتبع طلبك:</b>
 اضغط على 🔍 تتبع طلب في القائمة وأرسل: <code>${saved.orderNumber}</code>
@@ -1270,19 +1225,6 @@ ${discount > 0 ? `🎖️ <b>الخصم:</b> ${discount} ج\n` : ''}
     }
 });
 
-// ============ فحص العروض التلقائي ============
-setInterval(async () => {
-    console.log('🔍 جاري فحص العروض الجديدة...');
-    await broadcastOffersToAllCustomers();
-}, OFFERS_CHECK_INTERVAL);
-
-setTimeout(async () => {
-    console.log('🔍 فحص أولي للعروض...');
-    await broadcastOffersToAllCustomers();
-    await getProducts(true);
-    console.log('✅ تم تحميل البوت بنجاح');
-}, 30000);
-
 // ============ تنظيف الجلسات ============
 setInterval(() => {
     const now = Date.now();
@@ -1303,6 +1245,13 @@ setInterval(() => {
     }
 }, 30 * 60 * 1000);
 
+// ============ التحميل الأولي ============
+setTimeout(async () => {
+    console.log('🤖 جاري تحميل البوت...');
+    await getProducts(true);
+    console.log('✅ تم تحميل البوت بنجاح');
+}, 5000);
+
 // ============ مسار الـ Webhook لـ Vercel ============
 export default async function handler(req, res) {
     try {
@@ -1318,7 +1267,7 @@ export default async function handler(req, res) {
     }
 }
 
-// تشغيل محلي للتطوير
+// تشغيل محلي
 if (process.env.NODE_ENV !== 'production') {
     bot.launch();
     console.log('🤖 Bob Mart Bot is running locally...');
