@@ -48,9 +48,10 @@ class UserSession {
         this.editCart = [];
         this.pendingRating = null;
         this.tempOrderNumber = null;
-        this.useSavedAddress = false;
+        this.useSavedAddress = null;  // null = لم يختر بعد, true = نعم, false = لا
         this.appliedCoupon = null;
         this.couponDiscount = 0;
+        this.pendingFeedbackNote = null;  // لتخزين بيانات الملاحظة مؤقتاً
     }
     
     updateActivity() {
@@ -274,7 +275,7 @@ async function markCouponAsUsed(userId, couponCode) {
     });
 }
 
-// ============ دوال الطلبات المُصَححة ============
+// ============ دوال الطلبات ============
 async function saveOrder(userId, customerName, address, phone, items, subtotal, tierDiscount, couponDiscount, finalTotal, appliedCoupon = null) {
     try {
         const doc = await getDoc();
@@ -571,12 +572,15 @@ async function calculateDiscounts(userId, subtotal, appliedCouponCode = null) {
         }
     }
     
+    // تطبيق الخصم الأكبر فقط (المستوى أو الكوبون)
     let finalDiscountAmount = tierDiscountAmount;
     let usedCoupon = null;
+    let usedTier = true;
     
     if (couponValid && couponDiscountAmount > tierDiscountAmount) {
         finalDiscountAmount = couponDiscountAmount;
         usedCoupon = appliedCouponCode;
+        usedTier = false;
     }
     
     let finalTotal = subtotal - finalDiscountAmount;
@@ -588,10 +592,11 @@ async function calculateDiscounts(userId, subtotal, appliedCouponCode = null) {
     
     return {
         subtotal: subtotal,
-        tierDiscount: { percent: tierDiscountPercent, amount: tierDiscountAmount },
-        couponDiscount: { percent: couponValid ? (couponDiscountAmount * 100 / subtotal) : 0, amount: couponDiscountAmount, valid: couponValid, message: couponMessage },
+        tierDiscount: { percent: tierDiscountPercent, amount: tierDiscountAmount, applied: usedTier },
+        couponDiscount: { percent: couponValid ? Math.round(couponDiscountAmount * 100 / subtotal) : 0, amount: couponDiscountAmount, valid: couponValid, message: couponMessage, applied: !usedTier && couponValid },
         finalTotal: finalTotal,
-        usedCoupon: usedCoupon
+        usedCoupon: usedCoupon,
+        appliedDiscountType: usedCoupon ? 'coupon' : (tierDiscountAmount > 0 ? 'tier' : 'none')
     };
 }
 
@@ -750,15 +755,15 @@ async function showCart(ctx) {
     const discounts = await calculateDiscounts(userId, subtotal, session?.appliedCoupon);
     
     msg += `\n━━━━━━━━━━━━━━━\n`;
-    msg += `💰 <b>المجموع:</b> ${subtotal} ج\n`;
-    if (discounts.tierDiscount.amount > 0) {
-        msg += `🏆 <b>خصم المستوى:</b> -${discounts.tierDiscount.amount} ج\n`;
+    msg += `💰 <b>المجموع:</b> ${discounts.subtotal} ج\n`;
+    if (discounts.tierDiscount.amount > 0 && discounts.tierDiscount.applied) {
+        msg += `🏆 <b>خصم المستوى (${discounts.tierDiscount.percent}%):</b> -${discounts.tierDiscount.amount} ج\n`;
     }
-    if (discounts.couponDiscount.valid && discounts.couponDiscount.amount > 0) {
-        msg += `🎟️ <b>خصم الكوبون:</b> -${discounts.couponDiscount.amount} ج\n`;
+    if (discounts.couponDiscount.valid && discounts.couponDiscount.applied && discounts.couponDiscount.amount > 0) {
+        msg += `🎟️ <b>خصم الكوبون (${discounts.couponDiscount.percent}%):</b> -${discounts.couponDiscount.amount} ج\n`;
     }
     msg += `━━━━━━━━━━━━━━━\n`;
-    msg += `💎 <b>الإجمالي:</b> ${discounts.finalTotal} ج`;
+    msg += `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج`;
     
     buttons.push([Markup.button.callback('➕ إضافة منتجات', 'browse_products')]);
     buttons.push([Markup.button.callback('🎟️ إدخال كوبون', 'enter_coupon')]);
@@ -844,7 +849,7 @@ async function enterCoupon(ctx) {
     sessions.set(ctx.from.id, session);
 }
 
-// ============ عرض الطلبات المُصَحح ============
+// ============ عرض الطلبات ============
 async function showOrders(ctx) {
     const userId = ctx.from.id;
     const orders = await getUserOrders(userId);
@@ -872,9 +877,6 @@ async function showOrders(ctx) {
         if (order.tierDiscount > 0) msg += `   🏆 خصم المستوى: ${order.tierDiscount} ج\n`;
         if (order.couponDiscount > 0) msg += `   🎟️ خصم الكوبون: ${order.couponDiscount} ج\n`;
         msg += `   📍 ${order.status}\n`;
-        if (order.itemsText) {
-            msg += `   📦 <b>المنتجات:</b>\n   ${order.itemsText.replace(/• /g, '\n   • ')}\n`;
-        }
         msg += `━━━━━━━━━━━━━━━\n\n`;
         buttons.push([Markup.button.callback(`🔍 تتبع الطلب`, `track_${order.orderNumber}`)]);
     }
@@ -1200,17 +1202,29 @@ async function startCheckout(ctx) {
     
     const lastData = await getUserLastAddress(userId);
     
-    if (lastData && !session.useSavedAddress) {
-        session.useSavedAddress = null;
-        sessions.set(userId, session);
-        
+    // بناء رسالة ملخص الطلب
+    let cartSummary = '';
+    for (let i = 0; i < cart.length; i++) {
+        cartSummary += `${i+1}. ${cart[i].quantity} × ${cart[i].name} = ${cart[i].total} ج\n`;
+    }
+    
+    let discountSummary = '';
+    if (discounts.tierDiscount.amount > 0 && discounts.tierDiscount.applied) {
+        discountSummary += `🏆 خصم المستوى (${discounts.tierDiscount.percent}%): -${discounts.tierDiscount.amount} ج\n`;
+    }
+    if (discounts.couponDiscount.valid && discounts.couponDiscount.applied && discounts.couponDiscount.amount > 0) {
+        discountSummary += `🎟️ خصم الكوبون (${discounts.couponDiscount.percent}%): -${discounts.couponDiscount.amount} ج\n`;
+    }
+    
+    // التحقق مما إذا كان لدينا بيانات سابقة ولم يختر المستخدم بعد
+    if (lastData && session.useSavedAddress === null) {
         await ctx.reply(
             `🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n` +
-            cart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n') +
-            `\n\n💰 المجموع: ${subtotal} ج\n` +
-            (discounts.tierDiscount.amount > 0 ? `🏆 خصم المستوى: -${discounts.tierDiscount.amount} ج\n` : '') +
-            (discounts.couponDiscount.valid && discounts.couponDiscount.amount > 0 ? `🎟️ خصم الكوبون: -${discounts.couponDiscount.amount} ج\n` : '') +
-            `💎 الإجمالي: ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
+            cartSummary +
+            `\n💰 <b>المجموع:</b> ${discounts.subtotal} ج\n` +
+            discountSummary +
+            `━━━━━━━━━━━━━━━\n` +
+            `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
             `📦 <b>هل تريد استخدام بياناتك السابقة؟</b>\n\n` +
             `👤 الاسم: ${lastData.name}\n` +
             `📍 العنوان: ${lastData.address}\n` +
@@ -1219,34 +1233,36 @@ async function startCheckout(ctx) {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
                     [Markup.button.callback('✅ نعم، استخدم البيانات', 'use_saved_data')],
-                    [Markup.button.callback('📝 لا، أدخل بيانات جديدة', 'enter_new_data')]
+                    [Markup.button.callback('📝 لا، أدخل بيانات جديدة', 'enter_new_data')],
+                    [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
                 ])
             }
         );
         return;
     }
     
-    if (session.useSavedAddress === true && lastData) {
+    // إذا اختار المستخدم استخدام البيانات السابقة
+    if (lastData && session.useSavedAddress === true) {
         session.name = lastData.name;
         session.address = lastData.address;
         session.phone = lastData.phone;
-        session.useSavedAddress = false;
+        session.useSavedAddress = null; // إعادة التعيين بعد الاستخدام
         sessions.set(userId, session);
         await saveOrderWithData(ctx, userId, cart, discounts);
         return;
     }
     
+    // إذا اختار إدخال بيانات جديدة أو لا توجد بيانات سابقة
+    session.useSavedAddress = null; // إعادة التعيين
     session.status = 'ordering_name';
     sessions.set(userId, session);
     
-    const cartItems = cart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n');
-    
     await ctx.reply(
-        `🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n${cartItems}\n\n` +
-        `💰 المجموع: ${subtotal} ج\n` +
-        (discounts.tierDiscount.amount > 0 ? `🏆 خصم المستوى: -${discounts.tierDiscount.amount} ج\n` : '') +
-        (discounts.couponDiscount.valid && discounts.couponDiscount.amount > 0 ? `🎟️ خصم الكوبون: -${discounts.couponDiscount.amount} ج\n` : '') +
-        `💎 الإجمالي: ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
+        `🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n${cartSummary}\n` +
+        `💰 <b>المجموع:</b> ${discounts.subtotal} ج\n` +
+        discountSummary +
+        `━━━━━━━━━━━━━━━\n` +
+        `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
         `📝 أرسل اسمك الكامل:`,
         { parse_mode: 'HTML' }
     );
@@ -1279,6 +1295,14 @@ async function saveOrderWithData(ctx, userId, cart, discounts) {
         
         const productList = cart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n');
         
+        let discountText = '';
+        if (discounts.tierDiscount.amount > 0 && discounts.tierDiscount.applied) {
+            discountText += `🏆 <b>خصم المستوى (${discounts.tierDiscount.percent}%):</b> -${discounts.tierDiscount.amount} ج\n`;
+        }
+        if (discounts.couponDiscount.valid && discounts.couponDiscount.applied && discounts.couponDiscount.amount > 0) {
+            discountText += `🎟️ <b>خصم الكوبون (${discounts.couponDiscount.percent}%):</b> -${discounts.couponDiscount.amount} ج\n`;
+        }
+        
         const successMessage = 
 `✅ <b>تم تسجيل طلبك بنجاح!</b>
 ━━━━━━━━━━━━━━━
@@ -1291,8 +1315,7 @@ async function saveOrderWithData(ctx, userId, cart, discounts) {
 ${productList}
 ━━━━━━━━━━━━━━━
 💰 <b>المجموع:</b> ${discounts.subtotal} ج
-${discounts.tierDiscount.amount > 0 ? `🏆 <b>خصم المستوى:</b> -${discounts.tierDiscount.amount} ج\n` : ''}
-${discounts.couponDiscount.valid && discounts.couponDiscount.amount > 0 ? `🎟️ <b>خصم الكوبون:</b> -${discounts.couponDiscount.amount} ج\n` : ''}
+${discountText}
 ━━━━━━━━━━━━━━━
 💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج
 ━━━━━━━━━━━━━━━
@@ -1596,7 +1619,7 @@ bot.action('confirm_cancel', async (ctx) => {
     await confirmCancel(ctx);
 });
 
-// ============ أزرار التقييم المُصَححة ============
+// ============ أزرار التقييم ============
 for (let i = 1; i <= 5; i++) {
     bot.action(new RegExp(`rate_${i}(?:_(.*))?`), async (ctx) => {
         const rating = i;
@@ -1609,6 +1632,10 @@ for (let i = 1; i <= 5; i++) {
         const saved = await saveFeedback(userId, session.name || ctx.from.first_name, rating, '', orderNumber);
         
         if (saved) {
+            // تخزين بيانات التقييم مؤقتاً لانتظار الملاحظة
+            session.pendingFeedbackNote = { orderNumber, rating };
+            sessions.set(userId, session);
+            
             await ctx.reply(
                 `🙏 <b>شكراً لتقييمك ${'⭐'.repeat(rating)}</b>\n\n` +
                 `هل تريد إضافة ملاحظات إضافية؟`,
@@ -1626,7 +1653,7 @@ for (let i = 1; i <= 5; i++) {
     });
 }
 
-// ✅ زر إضافة ملاحظة - يعمل بشكل صحيح
+// زر إضافة ملاحظة
 bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     const rating = ctx.match[2];
@@ -1634,7 +1661,7 @@ bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
     
     const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
     session.status = 'feedback_note';
-    session.pendingRating = { orderNumber, rating };
+    session.pendingFeedbackNote = { orderNumber, rating: parseInt(rating) };
     sessions.set(ctx.from.id, session);
     
     await ctx.reply('📝 <b>أضف ملاحظاتك</b>\n\n✏️ اكتب ملاحظاتك أو اقتراحاتك هنا:\n\n(مثال: خدمة ممتازة أو اقتراح بإضافة منتج معين)', {
@@ -1645,15 +1672,10 @@ bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
 bot.action(/rate_order_(.+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     await ctx.answerCbQuery().catch(() => {});
-    
-    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
-    session.pendingRating = orderNumber;
-    sessions.set(ctx.from.id, session);
-    
     await showFeedbackButtons(ctx, orderNumber);
 });
 
-// ============ معالج النصوص المُصَحح (الأولويات الصحيحة) ============
+// ============ معالج النصوص ============
 bot.on('text', async (ctx) => {
     const userId = ctx.from.id;
     const text = ctx.message.text.trim();
@@ -1669,25 +1691,24 @@ bot.on('text', async (ctx) => {
     if (lastMessage && Date.now() - lastMessage < 1000) return;
     userCooldowns.set(userId, Date.now());
     
-    // ✅ الأولوية 1 والأعلى: ملاحظات التقييم (قبل أي شيء آخر!)
-    if (session.status === 'feedback_note' && session.pendingRating) {
-        const { orderNumber, rating } = session.pendingRating;
+    // الأولوية 1: ملاحظات التقييم
+    if (session.status === 'feedback_note' && session.pendingFeedbackNote) {
+        const { orderNumber, rating } = session.pendingFeedbackNote;
         
-        // حفظ الملاحظة في جدول Feedbakes
-        await saveFeedback(userId, session.name || ctx.from.first_name, parseInt(rating), text, orderNumber);
+        // حفظ الملاحظة في جدول Feedbakes (تحديث السجل الموجود أو إضافة جديد)
+        await saveFeedback(userId, session.name || ctx.from.first_name, rating, text, orderNumber);
         
         // إنهاء حالة التقييم
         session.status = 'main';
-        session.pendingRating = null;
+        session.pendingFeedbackNote = null;
         sessions.set(userId, session);
         
-        // تأكيد الاستلام
         await ctx.reply('🙏 <b>شكراً لملاحظاتك!</b>\n\nتم استلام ملاحظاتك وسنعمل على تحسين خدماتنا.', {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
         });
         
-        return; // مهم جداً: لا نكمل معالجة النص كمنتج
+        return;
     }
     
     // الأولوية 2: إدخال كوبون
@@ -1797,6 +1818,14 @@ bot.on('text', async (ctx) => {
             
             const productList = cart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n');
             
+            let discountText = '';
+            if (discounts.tierDiscount.amount > 0 && discounts.tierDiscount.applied) {
+                discountText += `🏆 <b>خصم المستوى (${discounts.tierDiscount.percent}%):</b> -${discounts.tierDiscount.amount} ج\n`;
+            }
+            if (discounts.couponDiscount.valid && discounts.couponDiscount.applied && discounts.couponDiscount.amount > 0) {
+                discountText += `🎟️ <b>خصم الكوبون (${discounts.couponDiscount.percent}%):</b> -${discounts.couponDiscount.amount} ج\n`;
+            }
+            
             const successMessage = 
 `✅ <b>تم تسجيل طلبك بنجاح!</b>
 ━━━━━━━━━━━━━━━
@@ -1809,8 +1838,7 @@ bot.on('text', async (ctx) => {
 ${productList}
 ━━━━━━━━━━━━━━━
 💰 <b>المجموع:</b> ${subtotal} ج
-${discounts.tierDiscount.amount > 0 ? `🏆 <b>خصم المستوى:</b> -${discounts.tierDiscount.amount} ج\n` : ''}
-${discounts.couponDiscount.valid && discounts.couponDiscount.amount > 0 ? `🎟️ <b>خصم الكوبون:</b> -${discounts.couponDiscount.amount} ج\n` : ''}
+${discountText}
 ━━━━━━━━━━━━━━━
 💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج
 ━━━━━━━━━━━━━━━
