@@ -46,12 +46,10 @@ class UserSession {
         this.lastOrderNumber = null;
         this.editingOrder = null;
         this.editCart = [];
-        this.pendingRating = null;
         this.tempOrderNumber = null;
-        this.useSavedAddress = null;  // null = لم يختر بعد, true = نعم, false = لا
+        this.useSavedAddress = null;
         this.appliedCoupon = null;
         this.couponDiscount = 0;
-        this.pendingFeedbackNote = null;  // لتخزين بيانات الملاحظة مؤقتاً
     }
     
     updateActivity() {
@@ -275,7 +273,7 @@ async function markCouponAsUsed(userId, couponCode) {
     });
 }
 
-// ============ دوال الطلبات ============
+// ============ دوال الطلبات (باستخدام الأعمدة الجديدة) ============
 async function saveOrder(userId, customerName, address, phone, items, subtotal, tierDiscount, couponDiscount, finalTotal, appliedCoupon = null) {
     try {
         const doc = await getDoc();
@@ -283,20 +281,14 @@ async function saveOrder(userId, customerName, address, phone, items, subtotal, 
         if (!sheet) {
             sheet = await doc.addSheet({
                 title: 'Orders',
-                headerValues: ['ID', 'اسم العميل', 'الطلبات', 'الإجمالي', 'خصم المستوى', 'خصم الكوبون', 'الصافي', 'العنوان', 'رقم الهاتف', 'التاريخ', 'عدد العناصر', 'رقم الطلب', 'الحالة', 'الكوبون المستخدم']
+                headerValues: ['ID', 'اسم العميل', 'الطلبات', 'الإجمالي', 'الإجمالي بعد الخصم', 'العنوان', 'رقم الهاتف', 'التاريخ', 'عدد العناصر', 'رقم الطلب', 'الحالة']
             });
         }
         
-        // حساب السعر الفعلي من المنتجات مباشرة
         let calculatedTotal = 0;
         for (const item of items) {
             calculatedTotal += item.price * item.quantity;
         }
-        
-        // التأكد من صحة الخصومات
-        const validSubtotal = calculatedTotal;
-        const validFinalTotal = finalTotal > 0 ? finalTotal : (validSubtotal - (tierDiscount || 0) - (couponDiscount || 0));
-        const finalValidTotal = validFinalTotal > 0 ? validFinalTotal : validSubtotal;
         
         const orderText = items.map(item => `${item.quantity} × ${item.name} (${item.price}ج) = ${item.price * item.quantity}ج`).join('\n• ');
         const timestamp = Date.now();
@@ -306,21 +298,18 @@ async function saveOrder(userId, customerName, address, phone, items, subtotal, 
             'ID': userId.toString(),
             'اسم العميل': customerName,
             'الطلبات': `• ${orderText}`,
-            'الإجمالي': validSubtotal,
-            'خصم المستوى': tierDiscount || 0,
-            'خصم الكوبون': couponDiscount || 0,
-            'الصافي': finalValidTotal,
+            'الإجمالي': calculatedTotal,
+            'الإجمالي بعد الخصم': finalTotal,
             'العنوان': address,
             'رقم الهاتف': phone,
             'التاريخ': new Date().toLocaleString('ar-EG'),
             'عدد العناصر': items.reduce((sum, i) => sum + i.quantity, 0),
             'رقم الطلب': orderNumber,
-            'الحالة': 'جاري التنفيذ',
-            'الكوبون المستخدم': appliedCoupon || ''
+            'الحالة': 'جاري التنفيذ'
         });
         
-        console.log(`✅ تم حفظ الطلب: ${orderNumber} - الإجمالي: ${validSubtotal} ج - الصافي: ${finalValidTotal} ج`);
-        return { success: true, orderNumber, finalTotal: finalValidTotal, subtotal: validSubtotal };
+        console.log(`✅ تم حفظ الطلب: ${orderNumber} - الإجمالي: ${calculatedTotal} ج - بعد الخصم: ${finalTotal} ج`);
+        return { success: true, orderNumber, finalTotal: finalTotal, subtotal: calculatedTotal };
     } catch (error) {
         console.error('❌ خطأ في حفظ الطلب:', error);
         return { success: false, error: error.message };
@@ -336,26 +325,21 @@ async function getUserOrders(userId) {
         const orders = [];
         for (const row of rows) {
             if (row.get('ID') === userId.toString()) {
-                let subtotal = parseFloat(row.get('الإجمالي')) || 0;
-                let netPrice = parseFloat(row.get('الصافي')) || 0;
-                
-                // إذا كان الصافي صفر ولكن المجموع أكبر من صفر
-                if (netPrice === 0 && subtotal > 0) {
-                    netPrice = subtotal;
-                }
+                const subtotal = parseFloat(row.get('الإجمالي')) || 0;
+                const finalTotal = parseFloat(row.get('الإجمالي بعد الخصم')) || subtotal;
+                const discountAmount = subtotal - finalTotal;
                 
                 orders.push({
                     orderNumber: row.get('رقم الطلب') || '',
-                    price: subtotal,
-                    netPrice: netPrice,
-                    tierDiscount: parseFloat(row.get('خصم المستوى')) || 0,
-                    couponDiscount: parseFloat(row.get('خصم الكوبون')) || 0,
-                    couponUsed: row.get('الكوبون المستخدم') || '',
+                    subtotal: subtotal,
+                    finalTotal: finalTotal,
+                    discountAmount: discountAmount > 0 ? discountAmount : 0,
                     date: row.get('التاريخ'),
                     status: row.get('الحالة') || 'جاري التنفيذ',
                     itemsText: row.get('الطلبات'),
                     address: row.get('العنوان'),
-                    phone: row.get('رقم الهاتف')
+                    phone: row.get('رقم الهاتف'),
+                    itemCount: parseInt(row.get('عدد العناصر')) || 0
                 });
             }
         }
@@ -376,23 +360,16 @@ async function getOrderByNumber(orderNumber) {
             if (row.get('رقم الطلب') === orderNumber) {
                 const status = row.get('الحالة') || 'جاري التنفيذ';
                 const subtotal = parseFloat(row.get('الإجمالي')) || 0;
-                let netPrice = parseFloat(row.get('الصافي')) || 0;
-                const tierDiscount = parseFloat(row.get('خصم المستوى')) || 0;
-                const couponDiscount = parseFloat(row.get('خصم الكوبون')) || 0;
-                
-                if (netPrice === 0 && subtotal > 0) {
-                    netPrice = subtotal;
-                }
+                const finalTotal = parseFloat(row.get('الإجمالي بعد الخصم')) || subtotal;
+                const discountAmount = subtotal - finalTotal;
                 
                 return {
                     orderNumber: row.get('رقم الطلب'),
                     name: row.get('اسم العميل'),
-                    text: row.get('الطلبات'),
-                    price: subtotal,
-                    netPrice: netPrice,
-                    tierDiscount: tierDiscount,
-                    couponDiscount: couponDiscount,
-                    couponUsed: row.get('الكوبون المستخدم') || '',
+                    itemsText: row.get('الطلبات'),
+                    subtotal: subtotal,
+                    finalTotal: finalTotal,
+                    discountAmount: discountAmount > 0 ? discountAmount : 0,
                     address: row.get('العنوان'),
                     phone: row.get('رقم الهاتف'),
                     date: row.get('التاريخ'),
@@ -445,8 +422,8 @@ async function addItemsToOrder(orderNumber, newItems) {
                 const newTotal = newItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
                 row.set('الإجمالي', oldTotal + newTotal);
                 
-                const oldNet = parseFloat(row.get('الصافي')) || oldTotal;
-                row.set('الصافي', oldNet + newTotal);
+                const oldFinal = parseFloat(row.get('الإجمالي بعد الخصم')) || oldTotal;
+                row.set('الإجمالي بعد الخصم', oldFinal + newTotal);
                 
                 const oldCount = parseInt(row.get('عدد العناصر')) || 0;
                 const newCount = newItems.reduce((sum, item) => sum + item.quantity, 0);
@@ -472,9 +449,9 @@ async function getUserTotalSpent(userId) {
         let total = 0;
         for (const row of rows) {
             if (row.get('ID') === userId.toString() && row.get('الحالة') !== 'ملغي') {
-                let netPrice = parseFloat(row.get('الصافي')) || 0;
-                if (netPrice === 0) netPrice = parseFloat(row.get('الإجمالي')) || 0;
-                total += netPrice;
+                let finalTotal = parseFloat(row.get('الإجمالي بعد الخصم')) || 0;
+                if (finalTotal === 0) finalTotal = parseFloat(row.get('الإجمالي')) || 0;
+                total += finalTotal;
             }
         }
         return total;
@@ -489,7 +466,7 @@ async function getUserLastAddress(userId) {
         const validOrders = orders.filter(o => o.status !== 'ملغي');
         if (validOrders.length > 0) {
             const lastOrder = validOrders[0];
-            return { address: lastOrder.address, phone: lastOrder.phone, name: lastOrder.name };
+            return { address: lastOrder.address, phone: lastOrder.phone, name: '' };
         }
         return null;
     } catch (error) {
@@ -572,7 +549,6 @@ async function calculateDiscounts(userId, subtotal, appliedCouponCode = null) {
         }
     }
     
-    // تطبيق الخصم الأكبر فقط (المستوى أو الكوبون)
     let finalDiscountAmount = tierDiscountAmount;
     let usedCoupon = null;
     let usedTier = true;
@@ -595,8 +571,7 @@ async function calculateDiscounts(userId, subtotal, appliedCouponCode = null) {
         tierDiscount: { percent: tierDiscountPercent, amount: tierDiscountAmount, applied: usedTier },
         couponDiscount: { percent: couponValid ? Math.round(couponDiscountAmount * 100 / subtotal) : 0, amount: couponDiscountAmount, valid: couponValid, message: couponMessage, applied: !usedTier && couponValid },
         finalTotal: finalTotal,
-        usedCoupon: usedCoupon,
-        appliedDiscountType: usedCoupon ? 'coupon' : (tierDiscountAmount > 0 ? 'tier' : 'none')
+        usedCoupon: usedCoupon
     };
 }
 
@@ -849,7 +824,7 @@ async function enterCoupon(ctx) {
     sessions.set(ctx.from.id, session);
 }
 
-// ============ عرض الطلبات ============
+// ============ عرض الطلبات (مع ظهور المنتجات) ============
 async function showOrders(ctx) {
     const userId = ctx.from.id;
     const orders = await getUserOrders(userId);
@@ -864,27 +839,42 @@ async function showOrders(ctx) {
         return;
     }
     
-    let msg = '📋 <b>طلباتي</b>\n━━━━━━━━━━━━━━━\n\n';
     const buttons = [];
     
-    for (let i = 0; i < Math.min(orders.length, 10); i++) {
+    for (let i = 0; i < orders.length; i++) {
         const order = orders[i];
         let icon = order.status === 'تم التسليم' ? '✅' : order.status === 'في الطريق' ? '🚚' : order.status === 'ملغي' ? '❌' : '🟡';
         
-        msg += `${i+1}. ${icon} <b>${order.date}</b>\n`;
-        msg += `   🏷️ <code>${order.orderNumber}</code>\n`;
-        msg += `   💰 <b>${order.netPrice} ج</b>\n`;
-        if (order.tierDiscount > 0) msg += `   🏆 خصم المستوى: ${order.tierDiscount} ج\n`;
-        if (order.couponDiscount > 0) msg += `   🎟️ خصم الكوبون: ${order.couponDiscount} ج\n`;
-        msg += `   📍 ${order.status}\n`;
-        msg += `━━━━━━━━━━━━━━━\n\n`;
-        buttons.push([Markup.button.callback(`🔍 تتبع الطلب`, `track_${order.orderNumber}`)]);
+        let msg = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        msg += `📋 <b>الطلب #${i + 1}</b>\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        msg += `${icon} <b>الحالة:</b> ${order.status}\n`;
+        msg += `🏷️ <b>رقم الطلب:</b> <code>${order.orderNumber}</code>\n`;
+        msg += `📅 <b>التاريخ:</b> ${order.date}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        msg += `📦 <b>المنتجات:</b>\n${order.itemsText || 'لا توجد منتجات'}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        msg += `💰 <b>الإجمالي:</b> ${order.subtotal} ج\n`;
+        if (order.discountAmount > 0) {
+            msg += `🎁 <b>الخصم:</b> -${order.discountAmount} ج\n`;
+        }
+        msg += `💎 <b>الإجمالي بعد الخصم:</b> ${order.finalTotal} ج\n`;
+        msg += `📍 <b>العنوان:</b> ${order.address}\n`;
+        msg += `📞 <b>الهاتف:</b> ${order.phone}\n`;
+        msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+        
+        buttons.push([Markup.button.callback(`🔍 تتبع الطلب ${i + 1}`, `track_${order.orderNumber}`)]);
     }
     
     buttons.push([Markup.button.callback('📊 إحصائياتي', 'my_stats')]);
     buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
     
-    await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+    await ctx.reply('📌 <b>اختر الإجراء المناسب:</b>', {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+    });
 }
 
 // ============ تتبع الطلب ============
@@ -923,14 +913,16 @@ async function trackOrder(ctx, orderNumber) {
     msg += `${icon} <b>الحالة:</b> ${order.status}\n`;
     msg += `📝 ${statusText}\n\n`;
     msg += `👤 <b>العميل:</b> ${order.name}\n`;
-    msg += `💰 <b>الإجمالي المدفوع:</b> ${order.netPrice} ج\n`;
-    if (order.tierDiscount > 0) msg += `🏆 <b>خصم المستوى:</b> ${order.tierDiscount} ج\n`;
-    if (order.couponDiscount > 0) msg += `🎟️ <b>خصم الكوبون:</b> ${order.couponDiscount} ج\n`;
-    if (order.couponUsed) msg += `🏷️ <b>الكوبون المستخدم:</b> ${order.couponUsed}\n`;
+    msg += `💰 <b>الإجمالي:</b> ${order.subtotal} ج\n`;
+    if (order.discountAmount > 0) {
+        msg += `🎁 <b>الخصم:</b> -${order.discountAmount} ج\n`;
+    }
+    msg += `💎 <b>الإجمالي المدفوع:</b> ${order.finalTotal} ج\n`;
     msg += `📍 <b>العنوان:</b> ${order.address}\n`;
+    msg += `📞 <b>الهاتف:</b> ${order.phone}\n`;
     msg += `📅 <b>التاريخ:</b> ${order.date}\n`;
     msg += `━━━━━━━━━━━━━━━\n\n`;
-    msg += `📦 <b>المنتجات:</b>\n${order.text}`;
+    msg += `📦 <b>المنتجات:</b>\n${order.itemsText}`;
     
     const buttons = [];
     
@@ -961,7 +953,7 @@ async function showStats(ctx) {
     const pending = orders.filter(o => o.status === 'جاري التنفيذ').length;
     const completed = orders.filter(o => o.status === 'تم التسليم').length;
     const cancelled = orders.filter(o => o.status === 'ملغي').length;
-    const totalDiscount = orders.reduce((sum, o) => sum + (o.tierDiscount || 0) + (o.couponDiscount || 0), 0);
+    const totalDiscount = orders.reduce((sum, o) => sum + o.discountAmount, 0);
     
     let tierName = '🟣 جديد', discount = 0, nextAmount = 100;
     if (totalSpent >= 5000) {
@@ -1041,7 +1033,7 @@ async function handleEditOrder(ctx, orderNumber) {
     sessions.set(ctx.from.id, session);
     
     await ctx.reply(`✏️ <b>تعديل الطلب #${orderNumber}</b>\n\n` +
-        `📦 المنتجات الحالية:\n${order.text}\n\n` +
+        `📦 المنتجات الحالية:\n${order.itemsText}\n\n` +
         `➕ أضف منتجات جديدة بالضغط على "🛒 المنتجات"\n` +
         `المنتجات الجديدة ستضاف إلى الطلب الحالي\n\n` +
         `بعد الانتهاء، اضغط "إنهاء التعديل"`,
@@ -1120,9 +1112,7 @@ async function handleCancelOrder(ctx, orderNumber) {
     
     await ctx.reply(`⚠️ <b>تأكيد إلغاء الطلب</b>\n\n` +
         `🏷️ ${order.orderNumber}\n` +
-        `💰 ${order.netPrice} ج\n` +
-        `🏆 خصم المستوى: ${order.tierDiscount} ج\n` +
-        `🎟️ خصم الكوبون: ${order.couponDiscount} ج\n\n` +
+        `💰 ${order.finalTotal} ج\n\n` +
         `⚠️ <b>ملاحظة مهمة:</b>\n` +
         `• سيتم استرجاع نقاط الولاء\n` +
         `• سيتم خصم قيمة الطلب من إجمالي مشترياتك\n` +
@@ -1155,7 +1145,7 @@ async function confirmCancel(ctx) {
         if (success) {
             const newTotalSpent = await getUserTotalSpent(userId);
             session.totalSpent = newTotalSpent;
-            session.subtractLoyaltyPoints(order.netPrice);
+            session.subtractLoyaltyPoints(order.finalTotal);
             sessions.set(userId, session);
             
             const newTier = session.getTier();
@@ -1202,7 +1192,6 @@ async function startCheckout(ctx) {
     
     const lastData = await getUserLastAddress(userId);
     
-    // بناء رسالة ملخص الطلب
     let cartSummary = '';
     for (let i = 0; i < cart.length; i++) {
         cartSummary += `${i+1}. ${cart[i].quantity} × ${cart[i].name} = ${cart[i].total} ج\n`;
@@ -1216,7 +1205,6 @@ async function startCheckout(ctx) {
         discountSummary += `🎟️ خصم الكوبون (${discounts.couponDiscount.percent}%): -${discounts.couponDiscount.amount} ج\n`;
     }
     
-    // التحقق مما إذا كان لدينا بيانات سابقة ولم يختر المستخدم بعد
     if (lastData && session.useSavedAddress === null) {
         await ctx.reply(
             `🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n` +
@@ -1226,7 +1214,6 @@ async function startCheckout(ctx) {
             `━━━━━━━━━━━━━━━\n` +
             `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
             `📦 <b>هل تريد استخدام بياناتك السابقة؟</b>\n\n` +
-            `👤 الاسم: ${lastData.name}\n` +
             `📍 العنوان: ${lastData.address}\n` +
             `📞 الهاتف: ${lastData.phone}`,
             {
@@ -1241,19 +1228,16 @@ async function startCheckout(ctx) {
         return;
     }
     
-    // إذا اختار المستخدم استخدام البيانات السابقة
     if (lastData && session.useSavedAddress === true) {
-        session.name = lastData.name;
         session.address = lastData.address;
         session.phone = lastData.phone;
-        session.useSavedAddress = null; // إعادة التعيين بعد الاستخدام
+        session.useSavedAddress = null;
         sessions.set(userId, session);
         await saveOrderWithData(ctx, userId, cart, discounts);
         return;
     }
     
-    // إذا اختار إدخال بيانات جديدة أو لا توجد بيانات سابقة
-    session.useSavedAddress = null; // إعادة التعيين
+    session.useSavedAddress = null;
     session.status = 'ordering_name';
     sessions.set(userId, session);
     
@@ -1272,7 +1256,7 @@ async function saveOrderWithData(ctx, userId, cart, discounts) {
     const session = sessions.get(userId);
     
     const saved = await saveOrder(
-        userId, session.name, session.address, session.phone, cart,
+        userId, session.name || 'عميل', session.address, session.phone, cart,
         discounts.subtotal, discounts.tierDiscount.amount,
         discounts.couponDiscount.valid ? discounts.couponDiscount.amount : 0,
         discounts.finalTotal, discounts.usedCoupon
@@ -1629,45 +1613,20 @@ for (let i = 1; i <= 5; i++) {
         
         await ctx.answerCbQuery(`✅ شكراً لتقييمك ${rating} نجوم!`).catch(() => {});
         
-        const saved = await saveFeedback(userId, session.name || ctx.from.first_name, rating, '', orderNumber);
+        await saveFeedback(userId, session.name || ctx.from.first_name, rating, '', orderNumber);
         
-        if (saved) {
-            // تخزين بيانات التقييم مؤقتاً لانتظار الملاحظة
-            session.pendingFeedbackNote = { orderNumber, rating };
-            sessions.set(userId, session);
-            
-            await ctx.reply(
-                `🙏 <b>شكراً لتقييمك ${'⭐'.repeat(rating)}</b>\n\n` +
-                `هل تريد إضافة ملاحظات إضافية؟`,
-                {
-                    parse_mode: 'HTML',
-                    ...Markup.inlineKeyboard([
-                        [Markup.button.callback('📝 إضافة ملاحظة', `add_note_${orderNumber}_${rating}`)],
-                        [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
-                    ])
-                }
-            );
-        } else {
-            await ctx.reply('❌ حدث خطأ في حفظ التقييم');
-        }
+        await ctx.reply(
+            `🙏 <b>شكراً لتقييمك ${'⭐'.repeat(rating)}</b>\n\n` +
+            `نقدر ملاحظاتك ونسعى دائماً لتحسين خدماتنا.`,
+            {
+                parse_mode: 'HTML',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+                ])
+            }
+        );
     });
 }
-
-// زر إضافة ملاحظة
-bot.action(/add_note_(.*)_(\d+)/, async (ctx) => {
-    const orderNumber = ctx.match[1];
-    const rating = ctx.match[2];
-    await ctx.answerCbQuery().catch(() => {});
-    
-    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
-    session.status = 'feedback_note';
-    session.pendingFeedbackNote = { orderNumber, rating: parseInt(rating) };
-    sessions.set(ctx.from.id, session);
-    
-    await ctx.reply('📝 <b>أضف ملاحظاتك</b>\n\n✏️ اكتب ملاحظاتك أو اقتراحاتك هنا:\n\n(مثال: خدمة ممتازة أو اقتراح بإضافة منتج معين)', {
-        parse_mode: 'HTML'
-    });
-});
 
 bot.action(/rate_order_(.+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
@@ -1691,27 +1650,7 @@ bot.on('text', async (ctx) => {
     if (lastMessage && Date.now() - lastMessage < 1000) return;
     userCooldowns.set(userId, Date.now());
     
-    // الأولوية 1: ملاحظات التقييم
-    if (session.status === 'feedback_note' && session.pendingFeedbackNote) {
-        const { orderNumber, rating } = session.pendingFeedbackNote;
-        
-        // حفظ الملاحظة في جدول Feedbakes (تحديث السجل الموجود أو إضافة جديد)
-        await saveFeedback(userId, session.name || ctx.from.first_name, rating, text, orderNumber);
-        
-        // إنهاء حالة التقييم
-        session.status = 'main';
-        session.pendingFeedbackNote = null;
-        sessions.set(userId, session);
-        
-        await ctx.reply('🙏 <b>شكراً لملاحظاتك!</b>\n\nتم استلام ملاحظاتك وسنعمل على تحسين خدماتنا.', {
-            parse_mode: 'HTML',
-            ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
-        });
-        
-        return;
-    }
-    
-    // الأولوية 2: إدخال كوبون
+    // إدخال كوبون
     if (session.status === 'entering_coupon') {
         const couponCode = text.toUpperCase().trim();
         const couponCheck = await validateCoupon(couponCode, userId);
@@ -1739,7 +1678,7 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // الأولوية 3: تتبع طلب
+    // تتبع طلب
     if (session.status === 'tracking') {
         session.status = 'main';
         sessions.set(userId, session);
@@ -1747,7 +1686,7 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // الأولوية 4: بحث
+    // بحث
     if (session.status === 'searching') {
         session.status = 'main';
         sessions.set(userId, session);
@@ -1755,7 +1694,7 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // الأولوية 5: إدخال اسم الطلب
+    // إدخال اسم الطلب
     if (session.status === 'ordering_name') {
         if (text.length < 3) {
             await ctx.reply('❌ الاسم قصير جداً، أرسل اسمك الكامل:');
@@ -1768,7 +1707,7 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // الأولوية 6: إدخال عنوان
+    // إدخال عنوان
     if (session.status === 'ordering_address') {
         if (text.length < 10) {
             await ctx.reply('❌ العنوان غير مفصل، أرسل عنواناً مفصلاً:');
@@ -1781,7 +1720,7 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // الأولوية 7: إدخال هاتف وحفظ الطلب
+    // إدخال هاتف وحفظ الطلب
     if (session.status === 'ordering_phone') {
         const phoneMatch = text.match(/01[0125][0-9]{8}/);
         if (!phoneMatch) {
