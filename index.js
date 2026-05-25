@@ -273,7 +273,7 @@ async function markCouponAsUsed(userId, couponCode) {
     });
 }
 
-// ============ دوال الطلبات (باستخدام الأعمدة الجديدة) ============
+// ============ دوال الطلبات ============
 async function saveOrder(userId, customerName, address, phone, items, subtotal, tierDiscount, couponDiscount, finalTotal, appliedCoupon = null) {
     try {
         const doc = await getDoc();
@@ -308,7 +308,7 @@ async function saveOrder(userId, customerName, address, phone, items, subtotal, 
             'الحالة': 'جاري التنفيذ'
         });
         
-        console.log(`✅ تم حفظ الطلب: ${orderNumber} - الإجمالي: ${calculatedTotal} ج - بعد الخصم: ${finalTotal} ج`);
+        console.log(`✅ تم حفظ الطلب: ${orderNumber}`);
         return { success: true, orderNumber, finalTotal: finalTotal, subtotal: calculatedTotal };
     } catch (error) {
         console.error('❌ خطأ في حفظ الطلب:', error);
@@ -495,25 +495,22 @@ async function getAllCustomers() {
     }
 }
 
-// ============ دوال التقييم ============
-async function saveFeedback(userId, userName, rating, message, orderNumber = '') {
+// ============ دوال التقييم (جدول Feedbacks بأربعة أعمدة) ============
+async function saveFeedback(userId, userName, rating) {
     try {
         const doc = await getDoc();
-        let sheet = doc.sheetsByTitle['Feedbakes'];
+        let sheet = doc.sheetsByTitle['Feedbacks'];
         if (!sheet) {
             sheet = await doc.addSheet({
-                title: 'Feedbakes',
-                headerValues: ['ID', 'الاسم', 'التقييم', 'الرسالة', 'التاريخ', 'رقم الطلب', 'تم الرد']
+                title: 'Feedbacks',
+                headerValues: ['ID', 'الاسم', 'التقييم', 'التاريخ']
             });
         }
         await sheet.addRow({
             'ID': userId.toString(),
             'الاسم': userName,
             'التقييم': rating,
-            'الرسالة': message || '',
-            'التاريخ': new Date().toLocaleString('ar-EG'),
-            'رقم الطلب': orderNumber,
-            'تم الرد': 'لا'
+            'التاريخ': new Date().toLocaleString('ar-EG')
         });
         console.log(`✅ تم حفظ تقييم ${rating} نجوم من ${userName}`);
         return true;
@@ -824,7 +821,7 @@ async function enterCoupon(ctx) {
     sessions.set(ctx.from.id, session);
 }
 
-// ============ عرض الطلبات (مع ظهور المنتجات) ============
+// ============ عرض الطلبات ============
 async function showOrders(ctx) {
     const userId = ctx.from.id;
     const orders = await getUserOrders(userId);
@@ -1603,21 +1600,20 @@ bot.action('confirm_cancel', async (ctx) => {
     await confirmCancel(ctx);
 });
 
-// ============ أزرار التقييم ============
+// ============ أزرار التقييم (بدون رسالة إضافية) ============
 for (let i = 1; i <= 5; i++) {
     bot.action(new RegExp(`rate_${i}(?:_(.*))?`), async (ctx) => {
         const rating = i;
-        const orderNumber = ctx.match[1] || '';
         const userId = ctx.from.id;
         const session = sessions.get(userId) || new UserSession(userId);
         
         await ctx.answerCbQuery(`✅ شكراً لتقييمك ${rating} نجوم!`).catch(() => {});
         
-        await saveFeedback(userId, session.name || ctx.from.first_name, rating, '', orderNumber);
+        await saveFeedback(userId, session.name || ctx.from.first_name, rating);
         
         await ctx.reply(
             `🙏 <b>شكراً لتقييمك ${'⭐'.repeat(rating)}</b>\n\n` +
-            `نقدر ملاحظاتك ونسعى دائماً لتحسين خدماتنا.`,
+            `نقدر رأيك ونسعى دائماً لتحسين خدماتنا.`,
             {
                 parse_mode: 'HTML',
                 ...Markup.inlineKeyboard([
