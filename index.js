@@ -160,7 +160,7 @@ async function getProducts(forceRefresh = false) {
     }
 }
 
-// ============ دوال العروض ============
+// ============ دوال العروض (باستخدام الأعمدة الجديدة) ============
 async function getOffers(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && offersCache && (now - offersCacheTime) < CACHE_TTL) {
@@ -175,13 +175,20 @@ async function getOffers(forceRefresh = false) {
         for (const row of rows) {
             const active = row.get('نشط');
             const text = row.get('العرض');
-            const date = row.get('التاريخ');
+            const price = row.get('السعر');
+            const endDate = row.get('تاريخ الإنتهاء');
+            
             if (active === 'نعم' && text) {
-                offers.push({ text, date: date || new Date().toLocaleString('ar-EG') });
+                offers.push({ 
+                    text: text, 
+                    price: price || 'غير محدد',
+                    endDate: endDate || 'غير محدد'
+                });
             }
         }
         offersCache = offers;
         offersCacheTime = now;
+        console.log(`✅ تم تحميل ${offers.length} عرض`);
         return offers;
     } catch (error) {
         console.error('❌ خطأ في العروض:', error);
@@ -189,7 +196,7 @@ async function getOffers(forceRefresh = false) {
     }
 }
 
-// ============ دوال الكوبونات ============
+// ============ دوال الكوبونات (عمودين فقط) ============
 async function getCoupons(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && couponsCache && (now - couponsCacheTime) < CACHE_TTL) {
@@ -201,38 +208,22 @@ async function getCoupons(forceRefresh = false) {
         if (!sheet) return [];
         const rows = await sheet.getRows();
         const coupons = [];
-        const today = new Date();
         
         for (const row of rows) {
             const code = row.get('Coupon');
             const discount = parseFloat(row.get('الخصم'));
-            const endDate = row.get('تاريخ الإنتهاء');
             
             if (!code || !discount) continue;
             
-            let isValid = true;
-            let expiryMessage = '';
-            
-            if (endDate) {
-                const end = new Date(endDate);
-                if (today > end) {
-                    isValid = false;
-                    expiryMessage = 'انتهت صلاحيته';
-                }
-            }
-            
             coupons.push({
                 code: code.toUpperCase(),
-                discount: discount,
-                endDate: endDate,
-                isValid: isValid,
-                expiryMessage: expiryMessage
+                discount: discount
             });
         }
         
         couponsCache = coupons;
         couponsCacheTime = now;
-        console.log(`✅ تم تحميل ${coupons.filter(c => c.isValid).length} كوبون صالح`);
+        console.log(`✅ تم تحميل ${coupons.length} كوبون`);
         return coupons;
     } catch (error) {
         console.error('❌ خطأ في الكوبونات:', error);
@@ -246,10 +237,6 @@ async function validateCoupon(code, userId) {
     
     if (!coupon) {
         return { valid: false, message: '❌ الكوبون غير صالح' };
-    }
-    
-    if (!coupon.isValid) {
-        return { valid: false, message: `❌ الكوبون ${coupon.expiryMessage}` };
     }
     
     const userKey = `${userId}_${coupon.code}`;
@@ -495,7 +482,7 @@ async function getAllCustomers() {
     }
 }
 
-// ============ دوال التقييم (جدول Feedbacks بأربعة أعمدة) ============
+// ============ دوال التقييم ============
 async function saveFeedback(userId, userName, rating) {
     try {
         const doc = await getDoc();
@@ -574,7 +561,7 @@ async function calculateDiscounts(userId, subtotal, appliedCouponCode = null) {
 
 // ============ البث التلقائي للعروض ============
 function getOffersHash(offers) {
-    return JSON.stringify(offers.map(o => ({ text: o.text, date: o.date })));
+    return JSON.stringify(offers.map(o => ({ text: o.text, price: o.price, endDate: o.endDate })));
 }
 
 async function broadcastOffersToAllCustomers() {
@@ -601,7 +588,7 @@ async function broadcastOffersToAllCustomers() {
             
             try {
                 const message = `🎁 <b>عروض حصرية من سوبر ماركت الحَواج!</b> 🎁\n━━━━━━━━━━━━━━━\n\n` +
-                    offers.map(o => `✨ ${o.text}\n📅 ${o.date}`).join('\n━━━━━━━━━━━━━━━\n') +
+                    offers.map(o => `✨ ${o.text}\n💰 السعر: ${o.price}\n📅 ينتهي: ${o.endDate}`).join('\n━━━━━━━━━━━━━━━\n') +
                     `\n\n⬇️ <b>اطلب الآن واستفد من العروض!</b>`;
                 
                 await bot.telegram.sendMessage(customer.id, message, {
@@ -761,7 +748,10 @@ async function showOffers(ctx) {
     
     let msg = '🎁 <b>عروض سوبر ماركت الحَواج</b>\n━━━━━━━━━━━━━━━\n\n';
     for (const offer of offers) {
-        msg += `✨ ${offer.text}\n📅 ${offer.date}\n━━━━━━━━━━━━━━━\n`;
+        msg += `✨ <b>${offer.text}</b>\n`;
+        msg += `💰 السعر: ${offer.price}\n`;
+        msg += `📅 ينتهي: ${offer.endDate}\n`;
+        msg += `━━━━━━━━━━━━━━━\n`;
     }
     
     await ctx.reply(msg, {
@@ -776,9 +766,8 @@ async function showOffers(ctx) {
 // ============ عرض الكوبونات ============
 async function showAvailableCoupons(ctx) {
     const coupons = await getCoupons();
-    const validCoupons = coupons.filter(c => c.isValid);
     
-    if (validCoupons.length === 0) {
+    if (coupons.length === 0) {
         await ctx.reply('🎟️ لا توجد كوبونات خصم متاحة حالياً', {
             ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
         });
@@ -786,16 +775,15 @@ async function showAvailableCoupons(ctx) {
     }
     
     let msg = '🎟️ <b>كوبونات الخصم المتاحة</b>\n━━━━━━━━━━━━━━━\n\n';
-    for (const coupon of validCoupons) {
+    for (const coupon of coupons) {
         msg += `🏷️ <b>الكود:</b> <code>${coupon.code}</code>\n`;
         msg += `💰 <b>الخصم:</b> ${coupon.discount}%\n`;
-        if (coupon.endDate) msg += `📅 <b>صالح حتى:</b> ${coupon.endDate}\n`;
         msg += `━━━━━━━━━━━━━━━\n`;
     }
     msg += `\n💡 <b>كيف تستخدم الكوبون؟</b>\n`;
     msg += `1. أضف منتجاتك للسلة\n`;
     msg += `2. اضغط "إدخال كوبون"\n`;
-    msg += `3. اكتب الكوبون مثل: <code>${validCoupons[0].code}</code>`;
+    msg += `3. اكتب الكوبون مثل: <code>${coupons[0].code}</code>`;
     
     await ctx.reply(msg, {
         parse_mode: 'HTML',
@@ -1600,7 +1588,7 @@ bot.action('confirm_cancel', async (ctx) => {
     await confirmCancel(ctx);
 });
 
-// ============ أزرار التقييم (بدون رسالة إضافية) ============
+// ============ أزرار التقييم ============
 for (let i = 1; i <= 5; i++) {
     bot.action(new RegExp(`rate_${i}(?:_(.*))?`), async (ctx) => {
         const rating = i;
