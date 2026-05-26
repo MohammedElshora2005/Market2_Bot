@@ -5,7 +5,7 @@ import { JWT } from 'google-auth-library';
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // ============ الإعدادات ============
-const ADMIN_ID = process.env.ADMIN_CHAT_ID;
+const ADMIN_ID = 'Muhamedhosny'; // معرف الأدمن على تليجرام
 const ITEMS_PER_PAGE = 6;
 const CACHE_TTL = 300000;
 const CART_EXPIRY_HOURS = 48;
@@ -30,6 +30,16 @@ let offersCache = null;
 let offersCacheTime = 0;
 let couponsCache = null;
 let couponsCacheTime = 0;
+
+// ============ دالة إرسال إشعار للأدمن ============
+async function notifyAdmin(message, parseMode = 'HTML') {
+    try {
+        await bot.telegram.sendMessage(ADMIN_ID, message, { parse_mode: parseMode });
+        console.log('📨 تم إرسال إشعار للأدمن');
+    } catch (error) {
+        console.error('❌ فشل إرسال الإشعار للأدمن:', error.message);
+    }
+}
 
 // ============ كلاس جلسة المستخدم ============
 class UserSession {
@@ -395,7 +405,6 @@ async function updateOrderStatus(orderNumber, newStatus) {
     }
 }
 
-// دالة لحذف منتجات من الطلب
 async function removeItemsFromOrder(orderNumber, itemsToRemove) {
     try {
         const doc = await getDoc();
@@ -414,14 +423,12 @@ async function removeItemsFromOrder(orderNumber, itemsToRemove) {
                 let newText = oldText;
                 
                 for (const item of itemsToRemove) {
-                    // البحث عن المنتج في النص
                     const pattern = new RegExp(`• \\d+ × ${item.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(${item.price}ج\\) = ${item.price * item.quantity}ج`, 'g');
                     newText = newText.replace(pattern, '');
                     removedTotal += item.price * item.quantity;
                     removedCount += item.quantity;
                 }
                 
-                // تنظيف النص من الأسطر الفارغة
                 newText = newText.replace(/\n• \n/g, '\n').replace(/\n\n/g, '\n');
                 if (newText.startsWith('• ')) {
                     newText = newText;
@@ -1045,7 +1052,6 @@ async function showOrderItemsForDeletion(ctx, orderNumber) {
         return;
     }
     
-    // استخراج المنتجات من النص
     const items = [];
     const lines = order.itemsText.split('\n');
     for (const line of lines) {
@@ -1089,7 +1095,6 @@ async function showOrderItemsForDeletion(ctx, orderNumber) {
     buttons.push([Markup.button.callback('❌ إلغاء', 'cancel_edit')]);
     buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
     
-    // تخزين المنتجات في الجلسة
     session.orderItems = items;
     sessions.set(ctx.from.id, session);
     
@@ -1112,7 +1117,6 @@ async function markItemForRemoval(ctx, itemIndex) {
     const item = session.orderItems[parseInt(itemIndex)];
     if (!item) return;
     
-    // التحقق إذا كان المنتج محدد بالفعل للحذف
     const alreadySelected = session.removeItems.find(i => i.name === item.name);
     if (alreadySelected) {
         await ctx.answerCbQuery(`⚠️ ${item.name} محدد بالفعل للحذف`).catch(() => {});
@@ -1124,7 +1128,6 @@ async function markItemForRemoval(ctx, itemIndex) {
     
     await ctx.answerCbQuery(`✅ تم تحديد ${item.name} للحذف`).catch(() => {});
     
-    // تحديث الرسالة لعرض المنتجات المحددة
     let msg = `🗑️ <b>حذف منتجات من الطلب #${session.editingOrder}</b>\n━━━━━━━━━━━━━━━\n\n`;
     msg += `📦 <b>المنتجات المحددة للحذف:</b>\n`;
     if (session.removeItems.length === 0) {
@@ -1155,7 +1158,7 @@ async function markItemForRemoval(ctx, itemIndex) {
     });
 }
 
-// ============ تأكيد حذف المنتجات ============
+// ============ تأكيد حذف المنتجات مع إشعار الأدمن ============
 async function confirmRemoveItems(ctx) {
     const userId = ctx.from.id;
     const session = sessions.get(userId);
@@ -1165,12 +1168,29 @@ async function confirmRemoveItems(ctx) {
         return;
     }
     
-    const success = await removeItemsFromOrder(session.editingOrder, session.removeItems);
+    const orderNumber = session.editingOrder;
+    const removedItems = [...session.removeItems];
+    
+    const success = await removeItemsFromOrder(orderNumber, session.removeItems);
     
     if (success) {
-        await ctx.reply(`✅ تم حذف ${session.removeItems.length} منتج من الطلب #${session.editingOrder} بنجاح`, {
-            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${session.editingOrder}`)]])
+        await ctx.reply(`✅ تم حذف ${session.removeItems.length} منتج من الطلب #${orderNumber} بنجاح`, {
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNumber}`)]])
         });
+        
+        // إرسال إشعار للأدمن بحذف منتجات من الطلب
+        const removedList = removedItems.map(item => `• ${item.quantity} × ${item.name} (${item.price}ج) = ${item.total}ج`).join('\n');
+        const adminMsg = `🗑️ <b>تم حذف منتجات من طلب</b>\n━━━━━━━━━━━━━━━\n` +
+            `👤 <b>العميل:</b> ${session.name || ctx.from.first_name}\n` +
+            `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
+            `🏷️ <b>رقم الطلب:</b> <code>${orderNumber}</code>\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `📦 <b>المنتجات المحذوفة:</b>\n${removedList}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `🕐 <b>التاريخ:</b> ${new Date().toLocaleString('ar-EG')}`;
+        
+        await notifyAdmin(adminMsg);
+        
     } else {
         await ctx.reply('❌ حدث خطأ في حذف المنتجات');
     }
@@ -1258,7 +1278,7 @@ async function showFeedbackButtons(ctx, orderNumber = '') {
     );
 }
 
-// ============ تعديل الطلب (إضافة منتجات فقط) ============
+// ============ تعديل الطلب (إضافة منتجات) ============
 async function handleEditOrder(ctx, orderNumber) {
     const order = await getOrderByNumber(orderNumber);
     
@@ -1304,19 +1324,36 @@ async function finishEdit(ctx) {
         return;
     }
     
-    const success = await addItemsToOrder(session.editingOrder, session.editCart);
+    const orderNumber = session.editingOrder;
+    const addedItems = [...session.editCart];
+    
+    const success = await addItemsToOrder(orderNumber, session.editCart);
     
     if (success) {
-        const addedItems = session.editCart.map(item => `${item.quantity} × ${item.name}`).join(', ');
-        const orderNum = session.editingOrder;
+        const addedItemsText = addedItems.map(item => `${item.quantity} × ${item.name}`).join(', ');
+        
         session.editCart = [];
         session.status = 'main';
         session.editingOrder = null;
         sessions.set(userId, session);
         
-        await ctx.reply(`✅ تم إضافة منتجات إلى الطلب #${orderNum} بنجاح!\n\n📦 تم إضافة: ${addedItems}`, {
-            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNum}`)]])
+        await ctx.reply(`✅ تم إضافة منتجات إلى الطلب #${orderNumber} بنجاح!\n\n📦 تم إضافة: ${addedItemsText}`, {
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNumber}`)]])
         });
+        
+        // إرسال إشعار للأدمن بإضافة منتجات للطلب
+        const addedList = addedItems.map(item => `• ${item.quantity} × ${item.name} (${item.price}ج) = ${item.price * item.quantity}ج`).join('\n');
+        const adminMsg = `➕ <b>تم إضافة منتجات إلى طلب</b>\n━━━━━━━━━━━━━━━\n` +
+            `👤 <b>العميل:</b> ${session.name || 'عميل'}\n` +
+            `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
+            `🏷️ <b>رقم الطلب:</b> <code>${orderNumber}</code>\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `📦 <b>المنتجات المضافة:</b>\n${addedList}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `🕐 <b>التاريخ:</b> ${new Date().toLocaleString('ar-EG')}`;
+        
+        await notifyAdmin(adminMsg);
+        
     } else {
         await ctx.reply('❌ حدث خطأ في تعديل الطلب');
     }
@@ -1339,7 +1376,7 @@ async function cancelEdit(ctx) {
     });
 }
 
-// ============ إلغاء الطلب ============
+// ============ إلغاء الطلب مع إشعار الأدمن ============
 async function handleCancelOrder(ctx, orderNumber) {
     const order = await getOrderByNumber(orderNumber);
     
@@ -1407,6 +1444,19 @@ async function confirmCancel(ctx) {
                     ])
                 }
             );
+            
+            // إرسال إشعار للأدمن بإلغاء الطلب
+            const adminMsg = `❌ <b>تم إلغاء طلب</b>\n━━━━━━━━━━━━━━━\n` +
+                `👤 <b>العميل:</b> ${session.name || 'عميل'}\n` +
+                `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
+                `🏷️ <b>رقم الطلب:</b> <code>${session.tempOrderNumber}</code>\n` +
+                `💰 <b>قيمة الطلب:</b> ${order.finalTotal} ج\n` +
+                `📅 <b>تاريخ الطلب:</b> ${order.date}\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `🕐 <b>تاريخ الإلغاء:</b> ${new Date().toLocaleString('ar-EG')}`;
+            
+            await notifyAdmin(adminMsg);
+            
         } else {
             await ctx.reply('❌ لا يمكن إلغاء هذا الطلب الآن');
         }
@@ -1496,6 +1546,7 @@ async function startCheckout(ctx) {
 
 async function saveOrderWithData(ctx, userId, cart, discounts) {
     const session = sessions.get(userId);
+    const orderCart = [...cart];
     
     const saved = await saveOrder(
         userId, session.name || 'عميل', session.address, session.phone, cart,
@@ -1519,7 +1570,7 @@ async function saveOrderWithData(ctx, userId, cart, discounts) {
         session.status = 'main';
         sessions.set(userId, session);
         
-        const productList = cart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n');
+        const productList = orderCart.map((item, i) => `${i+1}. ${item.quantity} × ${item.name} = ${item.total} ج`).join('\n');
         
         let discountText = '';
         if (discounts.tierDiscount.amount > 0 && discounts.tierDiscount.applied) {
@@ -1565,6 +1616,30 @@ ${discountText}
                 [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
             ])
         });
+        
+        // إرسال إشعار للأدمن بالطلب الجديد
+        const adminMsg = `🛍️ <b>طلب جديد!</b>\n━━━━━━━━━━━━━━━\n` +
+            `👤 <b>العميل:</b> ${session.name}\n` +
+            `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
+            `📱 <b>اسم المستخدم:</b> @${ctx.from.username || 'لا يوجد'}\n` +
+            `🏷️ <b>رقم الطلب:</b> <code>${saved.orderNumber}</code>\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `📦 <b>المنتجات:</b>\n${productList}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `💰 <b>المجموع:</b> ${discounts.subtotal} ج\n` +
+            `${discountText}` +
+            `💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `📍 <b>العنوان:</b> ${session.address}\n` +
+            `📞 <b>الهاتف:</b> ${session.phone}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `🏆 <b>مستوى العميل:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
+            `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `🕐 <b>تاريخ الطلب:</b> ${new Date().toLocaleString('ar-EG')}`;
+        
+        await notifyAdmin(adminMsg);
+        
     } else {
         await ctx.reply('❌ حدث خطأ في حفظ الطلب، حاول مرة أخرى');
     }
@@ -1802,7 +1877,6 @@ bot.action(/order_offer_(\d+)/, async (ctx) => {
     await handleOrderOffer(ctx, offerIndex);
 });
 
-// أزرار تعديل الطلب
 bot.action(/edit_order_(.+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     await ctx.answerCbQuery().catch(() => {});
@@ -1890,6 +1964,18 @@ for (let i = 1; i <= 5; i++) {
                 ])
             }
         );
+        
+        // إرسال إشعار للأدمن بتقييم جديد
+        const adminMsg = `⭐ <b>تقييم جديد</b>\n━━━━━━━━━━━━━━━\n` +
+            `👤 <b>العميل:</b> ${session.name || ctx.from.first_name}\n` +
+            `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
+            `📱 <b>اسم المستخدم:</b> @${ctx.from.username || 'لا يوجد'}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `🎖️ <b>التقييم:</b> ${rating} / 5 ${'⭐'.repeat(rating)}\n` +
+            `━━━━━━━━━━━━━━━\n` +
+            `🕐 <b>التاريخ:</b> ${new Date().toLocaleString('ar-EG')}`;
+        
+        await notifyAdmin(adminMsg);
     });
 }
 
@@ -1910,12 +1996,10 @@ bot.on('text', async (ctx) => {
         sessions.set(userId, session);
     }
     
-    // منع السبام
     const lastMessage = userCooldowns.get(userId);
     if (lastMessage && Date.now() - lastMessage < 1000) return;
     userCooldowns.set(userId, Date.now());
     
-    // إدخال كوبون
     if (session.status === 'entering_coupon') {
         const couponCode = text.toUpperCase().trim();
         const couponCheck = await validateCoupon(couponCode, userId);
@@ -1943,7 +2027,6 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // تتبع طلب
     if (session.status === 'tracking') {
         session.status = 'main';
         sessions.set(userId, session);
@@ -1951,7 +2034,6 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // بحث
     if (session.status === 'searching') {
         session.status = 'main';
         sessions.set(userId, session);
@@ -1959,7 +2041,6 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // إدخال اسم الطلب
     if (session.status === 'ordering_name') {
         if (text.length < 3) {
             await ctx.reply('❌ الاسم قصير جداً، أرسل اسمك الكامل:');
@@ -1972,7 +2053,6 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // إدخال عنوان
     if (session.status === 'ordering_address') {
         if (text.length < 10) {
             await ctx.reply('❌ العنوان غير مفصل، أرسل عنواناً مفصلاً:');
@@ -1985,7 +2065,6 @@ bot.on('text', async (ctx) => {
         return;
     }
     
-    // إدخال هاتف وحفظ الطلب
     if (session.status === 'ordering_phone') {
         const phoneMatch = text.match(/01[0125][0-9]{8}/);
         if (!phoneMatch) {
@@ -2066,13 +2145,35 @@ ${discountText}
                     [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
                 ])
             });
+            
+            const adminMsg = `🛍️ <b>طلب جديد!</b>\n━━━━━━━━━━━━━━━\n` +
+                `👤 <b>العميل:</b> ${session.name}\n` +
+                `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
+                `📱 <b>اسم المستخدم:</b> @${ctx.from.username || 'لا يوجد'}\n` +
+                `🏷️ <b>رقم الطلب:</b> <code>${saved.orderNumber}</code>\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `📦 <b>المنتجات:</b>\n${productList}\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `💰 <b>المجموع:</b> ${subtotal} ج\n` +
+                `${discountText}` +
+                `💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `📍 <b>العنوان:</b> ${session.address}\n` +
+                `📞 <b>الهاتف:</b> ${session.phone}\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `🏆 <b>مستوى العميل:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
+                `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `🕐 <b>تاريخ الطلب:</b> ${new Date().toLocaleString('ar-EG')}`;
+            
+            await notifyAdmin(adminMsg);
+            
         } else {
             await ctx.reply('❌ حدث خطأ في حفظ الطلب، حاول مرة أخرى');
         }
         return;
     }
     
-    // البحث العادي
     if (text.length > 2 && !text.startsWith('/')) {
         await showProducts(ctx, 0, text);
     } else if (!text.startsWith('/')) {
@@ -2129,7 +2230,6 @@ export default async function handler(req, res) {
     }
 }
 
-// تشغيل محلي
 if (process.env.NODE_ENV !== 'production') {
     bot.launch();
     console.log('🤖 سوبر ماركت الحَواج يعمل محلياً...');
