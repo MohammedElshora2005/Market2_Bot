@@ -46,10 +46,12 @@ class UserSession {
         this.lastOrderNumber = null;
         this.editingOrder = null;
         this.editCart = [];
+        this.removeItems = [];
         this.tempOrderNumber = null;
         this.useSavedAddress = null;
         this.appliedCoupon = null;
         this.couponDiscount = 0;
+        this.viewingEditCart = false;
     }
     
     updateActivity() {
@@ -393,6 +395,55 @@ async function updateOrderStatus(orderNumber, newStatus) {
     }
 }
 
+// دالة لحذف منتجات من الطلب
+async function removeItemsFromOrder(orderNumber, itemsToRemove) {
+    try {
+        const doc = await getDoc();
+        const sheet = doc.sheetsByTitle['Orders'];
+        if (!sheet) return false;
+        const rows = await sheet.getRows();
+        for (const row of rows) {
+            if (row.get('رقم الطلب') === orderNumber) {
+                let oldText = row.get('الطلبات');
+                let oldTotal = parseFloat(row.get('الإجمالي')) || 0;
+                let oldFinal = parseFloat(row.get('الإجمالي بعد الخصم')) || oldTotal;
+                let oldCount = parseInt(row.get('عدد العناصر')) || 0;
+                
+                let removedTotal = 0;
+                let removedCount = 0;
+                let newText = oldText;
+                
+                for (const item of itemsToRemove) {
+                    // البحث عن المنتج في النص
+                    const pattern = new RegExp(`• \\d+ × ${item.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(${item.price}ج\\) = ${item.price * item.quantity}ج`, 'g');
+                    newText = newText.replace(pattern, '');
+                    removedTotal += item.price * item.quantity;
+                    removedCount += item.quantity;
+                }
+                
+                // تنظيف النص من الأسطر الفارغة
+                newText = newText.replace(/\n• \n/g, '\n').replace(/\n\n/g, '\n');
+                if (newText.startsWith('• ')) {
+                    newText = newText;
+                } else if (newText.trim() === '') {
+                    newText = '• لا توجد منتجات';
+                }
+                
+                row.set('الطلبات', newText);
+                row.set('الإجمالي', oldTotal - removedTotal);
+                row.set('الإجمالي بعد الخصم', oldFinal - removedTotal);
+                row.set('عدد العناصر', oldCount - removedCount);
+                await row.save();
+                return true;
+            }
+        }
+        return false;
+    } catch (error) {
+        console.error('❌ خطأ في حذف المنتجات:', error);
+        return false;
+    }
+}
+
 async function addItemsToOrder(orderNumber, newItems) {
     try {
         const doc = await getDoc();
@@ -402,8 +453,16 @@ async function addItemsToOrder(orderNumber, newItems) {
         for (const row of rows) {
             if (row.get('رقم الطلب') === orderNumber) {
                 const oldText = row.get('الطلبات');
-                const newItemsText = newItems.map(item => `${item.quantity} × ${item.name} (${item.price}ج) = ${item.quantity * item.price}ج`).join('\n• ');
-                row.set('الطلبات', oldText + '\n• ' + newItemsText);
+                const newItemsText = newItems.map(item => `${item.quantity} × ${item.name} (${item.price}ج) = ${item.price * item.quantity}ج`).join('\n• ');
+                
+                let newText = oldText;
+                if (oldText === '• لا توجد منتجات') {
+                    newText = `• ${newItemsText}`;
+                } else {
+                    newText = oldText + '\n• ' + newItemsText;
+                }
+                
+                row.set('الطلبات', newText);
                 
                 const oldTotal = parseFloat(row.get('الإجمالي')) || 0;
                 const newTotal = newItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
@@ -829,7 +888,6 @@ async function handleOrderOffer(ctx, offerIndex) {
         return;
     }
     
-    // استخراج اسم المنتج من العرض (افتراضي)
     let productName = offer.text;
     let productPrice = parseFloat(offer.price);
     
@@ -840,7 +898,6 @@ async function handleOrderOffer(ctx, offerIndex) {
     const userId = ctx.from.id;
     let cart = carts.get(userId) || [];
     
-    // إضافة المنتج إلى السلة
     const existing = cart.find(item => item.name === productName);
     if (existing) {
         existing.quantity++;
@@ -964,8 +1021,9 @@ async function trackOrder(ctx, orderNumber) {
     const buttons = [];
     
     if (order.canEdit) {
-        buttons.push([Markup.button.callback('✏️ تعديل الطلب', `edit_order_${order.orderNumber}`)]);
-        buttons.push([Markup.button.callback('❌ إلغاء الطلب', `cancel_order_${order.orderNumber}`)]);
+        buttons.push([Markup.button.callback('✏️ تعديل الطلب (إضافة منتجات)', `edit_order_${order.orderNumber}`)]);
+        buttons.push([Markup.button.callback('🗑️ حذف منتجات من الطلب', `delete_items_${order.orderNumber}`)]);
+        buttons.push([Markup.button.callback('❌ إلغاء الطلب كاملاً', `cancel_order_${order.orderNumber}`)]);
     }
     
     if (order.status === 'تم التسليم') {
@@ -976,6 +1034,152 @@ async function trackOrder(ctx, orderNumber) {
     buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
     
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+}
+
+// ============ عرض منتجات الطلب للحذف ============
+async function showOrderItemsForDeletion(ctx, orderNumber) {
+    const order = await getOrderByNumber(orderNumber);
+    
+    if (!order || !order.canEdit) {
+        await ctx.reply('❌ لا يمكن تعديل هذا الطلب حالياً');
+        return;
+    }
+    
+    // استخراج المنتجات من النص
+    const items = [];
+    const lines = order.itemsText.split('\n');
+    for (const line of lines) {
+        const match = line.match(/(\d+) × (.+?) \((\d+)ج\) = (\d+)ج/);
+        if (match) {
+            items.push({
+                name: match[2],
+                price: parseInt(match[3]),
+                quantity: parseInt(match[1]),
+                total: parseInt(match[4])
+            });
+        }
+    }
+    
+    if (items.length === 0) {
+        await ctx.reply('❌ لا توجد منتجات لحذفها');
+        return;
+    }
+    
+    const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
+    session.status = 'deleting_items';
+    session.editingOrder = orderNumber;
+    session.removeItems = [];
+    sessions.set(ctx.from.id, session);
+    
+    let msg = `🗑️ <b>حذف منتجات من الطلب #${orderNumber}</b>\n━━━━━━━━━━━━━━━\n\n`;
+    msg += `📦 <b>المنتجات الحالية:</b>\n\n`;
+    
+    const buttons = [];
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        msg += `${i+1}. ${item.name}: ${item.quantity} × ${item.price} = ${item.total} ج\n`;
+        buttons.push([Markup.button.callback(`❌ حذف ${item.name}`, `remove_item_${i}`)]);
+    }
+    
+    msg += `\n━━━━━━━━━━━━━━━\n`;
+    msg += `⚠️ اضغط على المنتج الذي تريد حذفه\n`;
+    msg += `يمكنك حذف عدة منتجات ثم الضغط على "تأكيد الحذف"`;
+    
+    buttons.push([Markup.button.callback('✅ تأكيد الحذف', 'confirm_remove_items')]);
+    buttons.push([Markup.button.callback('❌ إلغاء', 'cancel_edit')]);
+    buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
+    
+    // تخزين المنتجات في الجلسة
+    session.orderItems = items;
+    sessions.set(ctx.from.id, session);
+    
+    await ctx.reply(msg, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+    });
+}
+
+// ============ إضافة منتج للحذف ============
+async function markItemForRemoval(ctx, itemIndex) {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    
+    if (!session || session.status !== 'deleting_items') {
+        await ctx.reply('❌ لا توجد عملية حذف نشطة');
+        return;
+    }
+    
+    const item = session.orderItems[parseInt(itemIndex)];
+    if (!item) return;
+    
+    // التحقق إذا كان المنتج محدد بالفعل للحذف
+    const alreadySelected = session.removeItems.find(i => i.name === item.name);
+    if (alreadySelected) {
+        await ctx.answerCbQuery(`⚠️ ${item.name} محدد بالفعل للحذف`).catch(() => {});
+        return;
+    }
+    
+    session.removeItems.push(item);
+    sessions.set(userId, session);
+    
+    await ctx.answerCbQuery(`✅ تم تحديد ${item.name} للحذف`).catch(() => {});
+    
+    // تحديث الرسالة لعرض المنتجات المحددة
+    let msg = `🗑️ <b>حذف منتجات من الطلب #${session.editingOrder}</b>\n━━━━━━━━━━━━━━━\n\n`;
+    msg += `📦 <b>المنتجات المحددة للحذف:</b>\n`;
+    if (session.removeItems.length === 0) {
+        msg += `❌ لم يتم تحديد أي منتج\n`;
+    } else {
+        for (const item of session.removeItems) {
+            msg += `• ${item.name}: ${item.quantity} × ${item.price} = ${item.total} ج\n`;
+        }
+    }
+    msg += `\n━━━━━━━━━━━━━━━\n`;
+    msg += `✅ تم تحديد ${session.removeItems.length} منتج\n`;
+    msg += `اضغط "تأكيد الحذف" لإتمام العملية`;
+    
+    const buttons = [];
+    for (let i = 0; i < session.orderItems.length; i++) {
+        const itm = session.orderItems[i];
+        const isSelected = session.removeItems.find(r => r.name === itm.name);
+        const prefix = isSelected ? '✅' : '❌';
+        buttons.push([Markup.button.callback(`${prefix} ${itm.name}`, `remove_item_${i}`)]);
+    }
+    buttons.push([Markup.button.callback('✅ تأكيد الحذف', 'confirm_remove_items')]);
+    buttons.push([Markup.button.callback('❌ إلغاء', 'cancel_edit')]);
+    buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
+    
+    await ctx.reply(msg, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+    });
+}
+
+// ============ تأكيد حذف المنتجات ============
+async function confirmRemoveItems(ctx) {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    
+    if (!session || session.status !== 'deleting_items' || session.removeItems.length === 0) {
+        await ctx.reply('❌ لم يتم تحديد أي منتج للحذف');
+        return;
+    }
+    
+    const success = await removeItemsFromOrder(session.editingOrder, session.removeItems);
+    
+    if (success) {
+        await ctx.reply(`✅ تم حذف ${session.removeItems.length} منتج من الطلب #${session.editingOrder} بنجاح`, {
+            ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${session.editingOrder}`)]])
+        });
+    } else {
+        await ctx.reply('❌ حدث خطأ في حذف المنتجات');
+    }
+    
+    session.status = 'main';
+    session.editingOrder = null;
+    session.removeItems = [];
+    session.orderItems = [];
+    sessions.set(userId, session);
 }
 
 // ============ عرض الإحصائيات ============
@@ -1054,7 +1258,7 @@ async function showFeedbackButtons(ctx, orderNumber = '') {
     );
 }
 
-// ============ تعديل الطلب ============
+// ============ تعديل الطلب (إضافة منتجات فقط) ============
 async function handleEditOrder(ctx, orderNumber) {
     const order = await getOrderByNumber(orderNumber);
     
@@ -1069,7 +1273,7 @@ async function handleEditOrder(ctx, orderNumber) {
     session.editCart = [];
     sessions.set(ctx.from.id, session);
     
-    await ctx.reply(`✏️ <b>تعديل الطلب #${orderNumber}</b>\n\n` +
+    await ctx.reply(`✏️ <b>إضافة منتجات إلى الطلب #${orderNumber}</b>\n\n` +
         `📦 المنتجات الحالية:\n${order.itemsText}\n\n` +
         `➕ أضف منتجات جديدة بالضغط على "🛒 المنتجات"\n` +
         `المنتجات الجديدة ستضاف إلى الطلب الحالي\n\n` +
@@ -1110,7 +1314,7 @@ async function finishEdit(ctx) {
         session.editingOrder = null;
         sessions.set(userId, session);
         
-        await ctx.reply(`✅ تم تعديل الطلب #${orderNum} بنجاح!\n\n📦 تم إضافة: ${addedItems}`, {
+        await ctx.reply(`✅ تم إضافة منتجات إلى الطلب #${orderNum} بنجاح!\n\n📦 تم إضافة: ${addedItems}`, {
             ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNum}`)]])
         });
     } else {
@@ -1126,6 +1330,7 @@ async function cancelEdit(ctx) {
         session.status = 'main';
         session.editingOrder = null;
         session.editCart = [];
+        session.removeItems = [];
         sessions.set(userId, session);
     }
     
@@ -1597,32 +1802,28 @@ bot.action(/order_offer_(\d+)/, async (ctx) => {
     await handleOrderOffer(ctx, offerIndex);
 });
 
-bot.action('noop', async (ctx) => {
-    await ctx.answerCbQuery().catch(() => {});
-});
-
-bot.action('use_saved_data', async (ctx) => {
-    const userId = ctx.from.id;
-    const session = sessions.get(userId) || new UserSession(userId);
-    session.useSavedAddress = true;
-    sessions.set(userId, session);
-    await ctx.answerCbQuery().catch(() => {});
-    await startCheckout(ctx);
-});
-
-bot.action('enter_new_data', async (ctx) => {
-    const userId = ctx.from.id;
-    const session = sessions.get(userId) || new UserSession(userId);
-    session.useSavedAddress = false;
-    sessions.set(userId, session);
-    await ctx.answerCbQuery().catch(() => {});
-    await startCheckout(ctx);
-});
-
+// أزرار تعديل الطلب
 bot.action(/edit_order_(.+)/, async (ctx) => {
     const orderNumber = ctx.match[1];
     await ctx.answerCbQuery().catch(() => {});
     await handleEditOrder(ctx, orderNumber);
+});
+
+bot.action(/delete_items_(.+)/, async (ctx) => {
+    const orderNumber = ctx.match[1];
+    await ctx.answerCbQuery().catch(() => {});
+    await showOrderItemsForDeletion(ctx, orderNumber);
+});
+
+bot.action(/remove_item_(\d+)/, async (ctx) => {
+    const itemIndex = ctx.match[1];
+    await ctx.answerCbQuery().catch(() => {});
+    await markItemForRemoval(ctx, itemIndex);
+});
+
+bot.action('confirm_remove_items', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await confirmRemoveItems(ctx);
 });
 
 bot.action(/cancel_order_(.+)/, async (ctx) => {
@@ -1644,6 +1845,28 @@ bot.action('cancel_edit', async (ctx) => {
 bot.action('confirm_cancel', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     await confirmCancel(ctx);
+});
+
+bot.action('noop', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action('use_saved_data', async (ctx) => {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId) || new UserSession(userId);
+    session.useSavedAddress = true;
+    sessions.set(userId, session);
+    await ctx.answerCbQuery().catch(() => {});
+    await startCheckout(ctx);
+});
+
+bot.action('enter_new_data', async (ctx) => {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId) || new UserSession(userId);
+    session.useSavedAddress = false;
+    sessions.set(userId, session);
+    await ctx.answerCbQuery().catch(() => {});
+    await startCheckout(ctx);
 });
 
 // ============ أزرار التقييم ============
