@@ -160,7 +160,7 @@ async function getProducts(forceRefresh = false) {
     }
 }
 
-// ============ دوال العروض (باستخدام الأعمدة الجديدة) ============
+// ============ دوال العروض ============
 async function getOffers(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && offersCache && (now - offersCacheTime) < CACHE_TTL) {
@@ -196,7 +196,7 @@ async function getOffers(forceRefresh = false) {
     }
 }
 
-// ============ دوال الكوبونات (عمودين فقط) ============
+// ============ دوال الكوبونات ============
 async function getCoupons(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && couponsCache && (now - couponsCacheTime) < CACHE_TTL) {
@@ -587,15 +587,21 @@ async function broadcastOffersToAllCustomers() {
             if (offeredCustomers.has(customerKey)) continue;
             
             try {
-                const message = `🎁 <b>عروض حصرية من سوبر ماركت الحَواج!</b> 🎁\n━━━━━━━━━━━━━━━\n\n` +
-                    offers.map(o => `✨ ${o.text}\n💰 السعر: ${o.price}\n📅 ينتهي: ${o.endDate}`).join('\n━━━━━━━━━━━━━━━\n') +
-                    `\n\n⬇️ <b>اطلب الآن واستفد من العروض!</b>`;
+                let offersText = '';
+                const offerButtons = [];
+                for (let i = 0; i < Math.min(offers.length, 5); i++) {
+                    const offer = offers[i];
+                    offersText += `✨ ${offer.text}\n💰 السعر: ${offer.price}\n📅 ينتهي: ${offer.endDate}\n━━━━━━━━━━━━━━━\n`;
+                    offerButtons.push([Markup.button.callback(`🛒 اطلب ${offer.text.substring(0, 20)}`, `order_offer_${i}`)]);
+                }
+                
+                const message = `🎁 <b>عروض حصرية من سوبر ماركت الحَواج!</b> 🎁\n━━━━━━━━━━━━━━━\n\n${offersText}\n⬇️ <b>اطلب الآن واستفد من العروض!</b>`;
                 
                 await bot.telegram.sendMessage(customer.id, message, {
                     parse_mode: 'HTML',
                     ...Markup.inlineKeyboard([
-                        [Markup.button.callback('🛒 تصفح المنتجات', 'browse_products')],
-                        [Markup.button.callback('🎁 عرض العروض', 'view_offers')],
+                        ...offerButtons,
+                        [Markup.button.callback('🛒 تصفح جميع المنتجات', 'browse_products')],
                         [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
                     ])
                 });
@@ -733,7 +739,7 @@ async function showCart(ctx) {
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 }
 
-// ============ عرض العروض ============
+// ============ عرض العروض مع أزرار ============
 async function showOffers(ctx) {
     const offers = await getOffers();
     if (offers.length === 0) {
@@ -746,20 +752,24 @@ async function showOffers(ctx) {
         return;
     }
     
+    const buttons = [];
     let msg = '🎁 <b>عروض سوبر ماركت الحَواج</b>\n━━━━━━━━━━━━━━━\n\n';
-    for (const offer of offers) {
+    
+    for (let i = 0; i < offers.length; i++) {
+        const offer = offers[i];
         msg += `✨ <b>${offer.text}</b>\n`;
         msg += `💰 السعر: ${offer.price}\n`;
         msg += `📅 ينتهي: ${offer.endDate}\n`;
         msg += `━━━━━━━━━━━━━━━\n`;
+        buttons.push([Markup.button.callback(`🛒 اطلب ${offer.text.substring(0, 25)}`, `order_offer_${i}`)]);
     }
+    
+    buttons.push([Markup.button.callback('🛒 تصفح جميع المنتجات', 'browse_products')]);
+    buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
     
     await ctx.reply(msg, {
         parse_mode: 'HTML',
-        ...Markup.inlineKeyboard([
-            [Markup.button.callback('🛒 المنتجات', 'browse_products')],
-            [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
-        ])
+        ...Markup.inlineKeyboard(buttons)
     });
 }
 
@@ -807,6 +817,48 @@ async function enterCoupon(ctx) {
     const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
     session.status = 'entering_coupon';
     sessions.set(ctx.from.id, session);
+}
+
+// ============ معالج طلب عرض ============
+async function handleOrderOffer(ctx, offerIndex) {
+    const offers = await getOffers();
+    const offer = offers[parseInt(offerIndex)];
+    
+    if (!offer) {
+        await ctx.reply('❌ العرض غير موجود');
+        return;
+    }
+    
+    // استخراج اسم المنتج من العرض (افتراضي)
+    let productName = offer.text;
+    let productPrice = parseFloat(offer.price);
+    
+    if (isNaN(productPrice)) {
+        productPrice = 0;
+    }
+    
+    const userId = ctx.from.id;
+    let cart = carts.get(userId) || [];
+    
+    // إضافة المنتج إلى السلة
+    const existing = cart.find(item => item.name === productName);
+    if (existing) {
+        existing.quantity++;
+    } else {
+        cart.push(new CartItem(productName, productPrice, 1));
+    }
+    carts.set(userId, cart);
+    
+    await ctx.answerCbQuery(`✅ تم إضافة ${productName} إلى السلة`).catch(() => {});
+    
+    await ctx.reply(`✅ تم إضافة <b>${productName}</b> إلى السلة\n💰 السعر: ${productPrice} ج`, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('🛍️ عرض السلة', 'view_cart')],
+            [Markup.button.callback('🛒 متابعة التسوق', 'browse_products')],
+            [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+        ])
+    });
 }
 
 // ============ عرض الطلبات ============
@@ -1537,6 +1589,12 @@ bot.action(/add_(.+)_(.+)/, async (ctx) => {
         carts.set(userId, cart);
         await ctx.reply(`✅ تم إضافة ${productName} إلى السلة`);
     }
+});
+
+bot.action(/order_offer_(\d+)/, async (ctx) => {
+    const offerIndex = ctx.match[1];
+    await ctx.answerCbQuery().catch(() => {});
+    await handleOrderOffer(ctx, offerIndex);
 });
 
 bot.action('noop', async (ctx) => {
