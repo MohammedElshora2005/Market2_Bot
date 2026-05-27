@@ -22,6 +22,7 @@ let isBroadcasting = false;
 let currentPage = 0;
 let currentProducts = [];
 let currentSearch = '';
+let currentCategory = '';
 
 // ============ كاش البيانات ============
 let productsCache = null;
@@ -30,6 +31,8 @@ let offersCache = null;
 let offersCacheTime = 0;
 let couponsCache = null;
 let couponsCacheTime = 0;
+let categoriesCache = null;
+let categoriesCacheTime = 0;
 
 // ============ دالة إرسال إشعار للأدمن ============
 async function notifyAdmin(message, parseMode = 'HTML') {
@@ -62,6 +65,7 @@ class UserSession {
         this.appliedCoupon = null;
         this.couponDiscount = 0;
         this.viewingEditCart = false;
+        this.selectedCategory = '';
     }
     
     updateActivity() {
@@ -101,12 +105,13 @@ class UserSession {
 
 // ============ كلاس عنصر السلة ============
 class CartItem {
-    constructor(name, price, quantity = 1) {
+    constructor(name, price, quantity = 1, category = '') {
         this.id = Date.now().toString();
         this.name = name;
         this.price = price;
         this.quantity = Math.min(quantity, 99);
         this.addedAt = Date.now();
+        this.category = category;
     }
     
     get total() {
@@ -138,7 +143,7 @@ async function getDoc() {
     return docInstance;
 }
 
-// ============ دوال المنتجات ============
+// ============ دوال المنتجات (مع دعم الأقسام) ============
 async function getProducts(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && productsCache && (now - productsCacheTime) < CACHE_TTL) {
@@ -150,26 +155,54 @@ async function getProducts(forceRefresh = false) {
         if (!sheet) return [];
         const rows = await sheet.getRows();
         const products = [];
+        const categoriesSet = new Set();
+        
         for (const row of rows) {
             const name = row.get('المنتج');
+            const category = row.get('القسم') || 'عام';
             const price = parseFloat(row.get('السعر'));
+            const unit = row.get('الوحدة') || 'قطعة';
             const available = row.get('التوفر');
+            
             let isAvailable = true;
             if (available === '0' || available === 'غير متوفر' || available === 'لا') {
                 isAvailable = false;
             }
+            
             if (name && price && !isNaN(price) && price > 0 && isAvailable) {
-                products.push({ name, price });
+                products.push({ name, category, price, unit });
+                categoriesSet.add(category);
             }
         }
+        
         productsCache = products;
         productsCacheTime = now;
-        console.log(`✅ تم تحميل ${products.length} منتج`);
+        categoriesCache = Array.from(categoriesSet).sort();
+        categoriesCacheTime = now;
+        
+        console.log(`✅ تم تحميل ${products.length} منتج من ${categoriesCache.length} قسم`);
         return products;
     } catch (error) {
         console.error('❌ خطأ في المنتجات:', error);
         return productsCache || [];
     }
+}
+
+async function getCategories(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && categoriesCache && (now - categoriesCacheTime) < CACHE_TTL) {
+        return categoriesCache;
+    }
+    await getProducts(forceRefresh);
+    return categoriesCache || [];
+}
+
+async function getProductsByCategory(category) {
+    const products = await getProducts();
+    if (category === 'all' || !category) {
+        return products;
+    }
+    return products.filter(p => p.category === category);
 }
 
 // ============ دوال العروض ============
@@ -272,7 +305,7 @@ async function markCouponAsUsed(userId, couponCode) {
     });
 }
 
-// ============ دوال الطلبات (باستخدام الجدول الجديد) ============
+// ============ دوال الطلبات ============
 async function saveOrder(userId, customerName, address, phone, items, subtotal, finalTotal, loyaltyPoints) {
     try {
         const doc = await getDoc();
@@ -308,7 +341,7 @@ async function saveOrder(userId, customerName, address, phone, items, subtotal, 
             'الحالة': 'جاري التنفيذ'
         });
         
-        console.log(`✅ تم حفظ الطلب: ${orderNumber} - الإجمالي: ${calculatedTotal} ج - بعد الخصم: ${finalTotal} ج - نقاط الولاء: ${loyaltyPoints}`);
+        console.log(`✅ تم حفظ الطلب: ${orderNumber}`);
         return { success: true, orderNumber, finalTotal: finalTotal, subtotal: calculatedTotal };
     } catch (error) {
         console.error('❌ خطأ في حفظ الطلب:', error);
@@ -726,13 +759,46 @@ async function broadcastOffersToAllCustomers() {
     }
 }
 
-// ============ عرض المنتجات ============
-async function showProducts(ctx, page = 0, searchQuery = '') {
+// ============ عرض الأقسام ============
+async function showCategories(ctx) {
+    const categories = await getCategories();
+    
+    if (categories.length === 0) {
+        await ctx.reply('⚠️ لا توجد أقسام متاحة حالياً', {
+            ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
+        });
+        return;
+    }
+    
+    const buttons = [];
+    for (const category of categories) {
+        buttons.push([Markup.button.callback(`📁 ${category}`, `category_${category}`)]);
+    }
+    buttons.push([Markup.button.callback('📦 جميع المنتجات', 'browse_products')]);
+    buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
+    
+    await ctx.reply('📂 <b>اختر القسم الذي تريد تصفحه:</b>', {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons)
+    });
+}
+
+// ============ عرض المنتجات (مع دعم الأقسام) ============
+async function showProducts(ctx, page = 0, searchQuery = '', category = '') {
     try {
-        let products = await getProducts();
+        let products;
+        if (category && category !== 'all') {
+            products = await getProductsByCategory(category);
+        } else {
+            products = await getProducts();
+        }
+        
         if (products.length === 0) {
-            await ctx.reply('⚠️ لا توجد منتجات متاحة حالياً', {
-                ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
+            await ctx.reply('⚠️ لا توجد منتجات في هذا القسم', {
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('📂 عرض الأقسام', 'show_categories')],
+                    [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+                ])
             });
             return;
         }
@@ -748,6 +814,7 @@ async function showProducts(ctx, page = 0, searchQuery = '') {
         currentProducts = products;
         currentPage = page;
         currentSearch = searchQuery;
+        currentCategory = category;
         
         const totalPages = Math.ceil(products.length / ITEMS_PER_PAGE);
         const start = page * ITEMS_PER_PAGE;
@@ -768,10 +835,12 @@ async function showProducts(ctx, page = 0, searchQuery = '') {
         if (navRow.length > 1) buttons.push(navRow);
         
         buttons.push([Markup.button.callback('🔍 بحث', 'search_products')]);
+        buttons.push([Markup.button.callback('📂 أقسام', 'show_categories')]);
         buttons.push([Markup.button.callback('🛍️ السلة', 'view_cart')]);
         buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
         
         let msg = '🛒 <b>المنتجات</b>\n━━━━━━━━━━━━━━━\n';
+        if (category) msg += `📂 القسم: ${category}\n`;
         if (searchQuery) msg += `🔍 بحث: "${searchQuery}"\n`;
         msg += `📦 ${products.length} منتج\n━━━━━━━━━━━━━━━\n\n➕ اضغط على المنتج للإضافة`;
         
@@ -791,6 +860,7 @@ async function showCart(ctx) {
         await ctx.reply('🛍️ سلتك فارغة', {
             ...Markup.inlineKeyboard([
                 [Markup.button.callback('🛒 المنتجات', 'browse_products')],
+                [Markup.button.callback('📂 الأقسام', 'show_categories')],
                 [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
             ])
         });
@@ -831,6 +901,7 @@ async function showCart(ctx) {
     msg += `\n⭐ <b>نقاط الولاء المتوقعة:</b> ${points} نقطة`;
     
     buttons.push([Markup.button.callback('➕ إضافة منتجات', 'browse_products')]);
+    buttons.push([Markup.button.callback('📂 أقسام', 'show_categories')]);
     buttons.push([Markup.button.callback('🎟️ إدخال كوبون', 'enter_coupon')]);
     buttons.push([Markup.button.callback('✅ تأكيد الطلب', 'checkout')]);
     buttons.push([Markup.button.callback('🗑️ تفريغ السلة', 'clear_cart')]);
@@ -846,6 +917,7 @@ async function showOffers(ctx) {
         await ctx.reply('🎁 لا توجد عروض حالياً', {
             ...Markup.inlineKeyboard([
                 [Markup.button.callback('🛒 المنتجات', 'browse_products')],
+                [Markup.button.callback('📂 الأقسام', 'show_categories')],
                 [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
             ])
         });
@@ -865,6 +937,7 @@ async function showOffers(ctx) {
     }
     
     buttons.push([Markup.button.callback('🛒 تصفح جميع المنتجات', 'browse_products')]);
+    buttons.push([Markup.button.callback('📂 الأقسام', 'show_categories')]);
     buttons.push([Markup.button.callback('🏠 الرئيسية', 'main_menu')]);
     
     await ctx.reply(msg, {
@@ -899,6 +972,7 @@ async function showAvailableCoupons(ctx) {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
             [Markup.button.callback('🛒 التسوق الآن', 'browse_products')],
+            [Markup.button.callback('📂 الأقسام', 'show_categories')],
             [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
         ])
     });
@@ -954,6 +1028,7 @@ async function handleOrderOffer(ctx, offerIndex) {
         ...Markup.inlineKeyboard([
             [Markup.button.callback('🛍️ عرض السلة', 'view_cart')],
             [Markup.button.callback('🛒 متابعة التسوق', 'browse_products')],
+            [Markup.button.callback('📂 الأقسام', 'show_categories')],
             [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
         ])
     });
@@ -968,6 +1043,7 @@ async function showOrders(ctx) {
         await ctx.reply('📭 لا يوجد طلبات سابقة', {
             ...Markup.inlineKeyboard([
                 [Markup.button.callback('🛒 المنتجات', 'browse_products')],
+                [Markup.button.callback('📂 الأقسام', 'show_categories')],
                 [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
             ])
         });
@@ -1332,13 +1408,14 @@ async function handleEditOrder(ctx, orderNumber) {
     
     await ctx.reply(`✏️ <b>إضافة منتجات إلى الطلب #${orderNumber}</b>\n\n` +
         `📦 المنتجات الحالية:\n${order.itemsText}\n\n` +
-        `➕ أضف منتجات جديدة بالضغط على "🛒 المنتجات"\n` +
+        `➕ أضف منتجات جديدة بالضغط على "🛒 المنتجات" أو "📂 الأقسام"\n` +
         `المنتجات الجديدة ستضاف إلى الطلب الحالي\n\n` +
         `بعد الانتهاء، اضغط "إنهاء التعديل"`,
         {
             parse_mode: 'HTML',
             ...Markup.inlineKeyboard([
                 [Markup.button.callback('🛒 المنتجات', 'browse_products')],
+                [Markup.button.callback('📂 الأقسام', 'show_categories')],
                 [Markup.button.callback('✅ إنهاء التعديل', 'finish_edit')],
                 [Markup.button.callback('❌ إلغاء', 'cancel_edit')],
                 [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
@@ -1357,7 +1434,7 @@ async function finishEdit(ctx) {
     }
     
     if (session.editCart.length === 0) {
-        await ctx.reply('⚠️ لم تقم بإضافة أي منتجات جديدة\n\nلإضافة منتجات، اضغط على "🛒 المنتجات" ثم اختر المنتجات');
+        await ctx.reply('⚠️ لم تقم بإضافة أي منتجات جديدة\n\nلإضافة منتجات، اضغط على "🛒 المنتجات" أو "📂 الأقسام" ثم اختر المنتجات');
         return;
     }
     
@@ -1688,7 +1765,10 @@ ${discountText}
 // ============ البحث والتتبع ============
 async function handleSearch(ctx) {
     await ctx.reply('🔍 اكتب اسم المنتج:', {
-        ...Markup.inlineKeyboard([[Markup.button.callback('🏠 الرئيسية', 'main_menu')]])
+        ...Markup.inlineKeyboard([
+            [Markup.button.callback('📂 الأقسام', 'show_categories')],
+            [Markup.button.callback('🏠 الرئيسية', 'main_menu')]
+        ])
     });
     const session = sessions.get(ctx.from.id) || new UserSession(ctx.from.id);
     session.status = 'searching';
@@ -1711,6 +1791,7 @@ async function handleTrack(ctx) {
 // ============ القائمة الرئيسية ============
 const mainKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 المنتجات', 'browse_products')],
+    [Markup.button.callback('📂 الأقسام', 'show_categories')],
     [Markup.button.callback('🛍️ السلة', 'view_cart')],
     [Markup.button.callback('🎁 العروض', 'view_offers')],
     [Markup.button.callback('🎟️ الكوبونات', 'show_coupons')],
@@ -1744,6 +1825,7 @@ bot.start(async (ctx) => {
         `⭐ <b>نقاط الولاء:</b> ${loyaltyPoints} نقطة\n\n` +
         `🛒 أكبر سوبر ماركت في العالم!\n` +
         `✅ توصيل سريع - أسعار تنافسية - جودة عالية\n` +
+        `📂 تصفح المنتجات حسب الأقسام!\n` +
         `💡 <b>ملاحظة:</b> كل 10 ج = 1 نقطة ولاء\n━━━━━━━━━━━━━━━\n\n` +
         `📌 اختر من القائمة:`;
     
@@ -1757,7 +1839,20 @@ bot.action('main_menu', async (ctx) => {
 
 bot.action('browse_products', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
+    currentCategory = '';
     await showProducts(ctx);
+});
+
+bot.action('show_categories', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await showCategories(ctx);
+});
+
+bot.action(/category_(.+)/, async (ctx) => {
+    const category = ctx.match[1];
+    await ctx.answerCbQuery(`📂 عرض منتجات قسم ${category}`).catch(() => {});
+    currentCategory = category;
+    await showProducts(ctx, 0, '', category);
 });
 
 bot.action('view_cart', async (ctx) => {
@@ -1819,12 +1914,12 @@ bot.action('enter_coupon', async (ctx) => {
 
 bot.action('next_page', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await showProducts(ctx, currentPage + 1, currentSearch);
+    await showProducts(ctx, currentPage + 1, currentSearch, currentCategory);
 });
 
 bot.action('prev_page', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await showProducts(ctx, currentPage - 1, currentSearch);
+    await showProducts(ctx, currentPage - 1, currentSearch, currentCategory);
 });
 
 bot.action(/track_(.+)/, async (ctx) => {
@@ -1893,6 +1988,11 @@ bot.action(/add_(.+)_(.+)/, async (ctx) => {
     
     await ctx.answerCbQuery(`✅ تم إضافة ${productName}`).catch(() => {});
     
+    // البحث عن القسم للمنتج
+    const products = await getProducts();
+    const product = products.find(p => p.name === productName);
+    const category = product ? product.category : '';
+    
     if (session && session.status === 'editing') {
         const existing = session.editCart.find(item => item.name === productName);
         if (existing) {
@@ -1908,7 +2008,7 @@ bot.action(/add_(.+)_(.+)/, async (ctx) => {
         if (existing) {
             existing.quantity++;
         } else {
-            cart.push(new CartItem(productName, productPrice, 1));
+            cart.push(new CartItem(productName, productPrice, 1, category));
         }
         carts.set(userId, cart);
         await ctx.reply(`✅ تم إضافة ${productName} إلى السلة`);
@@ -2080,7 +2180,7 @@ bot.on('text', async (ctx) => {
     if (session.status === 'searching') {
         session.status = 'main';
         sessions.set(userId, session);
-        await showProducts(ctx, 0, text);
+        await showProducts(ctx, 0, text, '');
         return;
     }
     
@@ -2217,7 +2317,7 @@ ${discountText}
     }
     
     if (text.length > 2 && !text.startsWith('/')) {
-        await showProducts(ctx, 0, text);
+        await showProducts(ctx, 0, text, '');
     } else if (!text.startsWith('/')) {
         await ctx.reply('🔍 استخدم الأزرار للتنقل', { ...mainKeyboard });
     }
