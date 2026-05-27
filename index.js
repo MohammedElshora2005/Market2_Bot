@@ -5,7 +5,7 @@ import { JWT } from 'google-auth-library';
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // ============ الإعدادات ============
-const ADMIN_ID = 'Muhamedhosny'; // معرف الأدمن على تليجرام
+const ADMIN_ID = process.env.ADMIN_CHAT_ID || 'Muhamedhosny';
 const ITEMS_PER_PAGE = 6;
 const CACHE_TTL = 300000;
 const CART_EXPIRY_HOURS = 48;
@@ -272,15 +272,15 @@ async function markCouponAsUsed(userId, couponCode) {
     });
 }
 
-// ============ دوال الطلبات ============
-async function saveOrder(userId, customerName, address, phone, items, subtotal, tierDiscount, couponDiscount, finalTotal, appliedCoupon = null) {
+// ============ دوال الطلبات (باستخدام الجدول الجديد) ============
+async function saveOrder(userId, customerName, address, phone, items, subtotal, finalTotal, loyaltyPoints) {
     try {
         const doc = await getDoc();
         let sheet = doc.sheetsByTitle['Orders'];
         if (!sheet) {
             sheet = await doc.addSheet({
                 title: 'Orders',
-                headerValues: ['ID', 'اسم العميل', 'الطلبات', 'الإجمالي', 'الإجمالي بعد الخصم', 'العنوان', 'رقم الهاتف', 'التاريخ', 'عدد العناصر', 'رقم الطلب', 'الحالة']
+                headerValues: ['ID', 'اسم العميل', 'الطلبات', 'الإجمالي', 'الإجمالي بعد الخصم', 'نقاط الولاء', 'العنوان', 'رقم الهاتف', 'التاريخ', 'عدد العناصر', 'رقم الطلب', 'الحالة']
             });
         }
         
@@ -299,6 +299,7 @@ async function saveOrder(userId, customerName, address, phone, items, subtotal, 
             'الطلبات': `• ${orderText}`,
             'الإجمالي': calculatedTotal,
             'الإجمالي بعد الخصم': finalTotal,
+            'نقاط الولاء': loyaltyPoints,
             'العنوان': address,
             'رقم الهاتف': phone,
             'التاريخ': new Date().toLocaleString('ar-EG'),
@@ -307,7 +308,7 @@ async function saveOrder(userId, customerName, address, phone, items, subtotal, 
             'الحالة': 'جاري التنفيذ'
         });
         
-        console.log(`✅ تم حفظ الطلب: ${orderNumber}`);
+        console.log(`✅ تم حفظ الطلب: ${orderNumber} - الإجمالي: ${calculatedTotal} ج - بعد الخصم: ${finalTotal} ج - نقاط الولاء: ${loyaltyPoints}`);
         return { success: true, orderNumber, finalTotal: finalTotal, subtotal: calculatedTotal };
     } catch (error) {
         console.error('❌ خطأ في حفظ الطلب:', error);
@@ -327,12 +328,14 @@ async function getUserOrders(userId) {
                 const subtotal = parseFloat(row.get('الإجمالي')) || 0;
                 const finalTotal = parseFloat(row.get('الإجمالي بعد الخصم')) || subtotal;
                 const discountAmount = subtotal - finalTotal;
+                const loyaltyPoints = parseFloat(row.get('نقاط الولاء')) || 0;
                 
                 orders.push({
                     orderNumber: row.get('رقم الطلب') || '',
                     subtotal: subtotal,
                     finalTotal: finalTotal,
                     discountAmount: discountAmount > 0 ? discountAmount : 0,
+                    loyaltyPoints: loyaltyPoints,
                     date: row.get('التاريخ'),
                     status: row.get('الحالة') || 'جاري التنفيذ',
                     itemsText: row.get('الطلبات'),
@@ -361,6 +364,7 @@ async function getOrderByNumber(orderNumber) {
                 const subtotal = parseFloat(row.get('الإجمالي')) || 0;
                 const finalTotal = parseFloat(row.get('الإجمالي بعد الخصم')) || subtotal;
                 const discountAmount = subtotal - finalTotal;
+                const loyaltyPoints = parseFloat(row.get('نقاط الولاء')) || 0;
                 
                 return {
                     orderNumber: row.get('رقم الطلب'),
@@ -369,6 +373,7 @@ async function getOrderByNumber(orderNumber) {
                     subtotal: subtotal,
                     finalTotal: finalTotal,
                     discountAmount: discountAmount > 0 ? discountAmount : 0,
+                    loyaltyPoints: loyaltyPoints,
                     address: row.get('العنوان'),
                     phone: row.get('رقم الهاتف'),
                     date: row.get('التاريخ'),
@@ -436,9 +441,13 @@ async function removeItemsFromOrder(orderNumber, itemsToRemove) {
                     newText = '• لا توجد منتجات';
                 }
                 
+                const newFinal = oldFinal - removedTotal;
+                const newPoints = Math.floor(newFinal / 10);
+                
                 row.set('الطلبات', newText);
                 row.set('الإجمالي', oldTotal - removedTotal);
-                row.set('الإجمالي بعد الخصم', oldFinal - removedTotal);
+                row.set('الإجمالي بعد الخصم', newFinal);
+                row.set('نقاط الولاء', newPoints);
                 row.set('عدد العناصر', oldCount - removedCount);
                 await row.save();
                 return true;
@@ -476,7 +485,11 @@ async function addItemsToOrder(orderNumber, newItems) {
                 row.set('الإجمالي', oldTotal + newTotal);
                 
                 const oldFinal = parseFloat(row.get('الإجمالي بعد الخصم')) || oldTotal;
-                row.set('الإجمالي بعد الخصم', oldFinal + newTotal);
+                const newFinal = oldFinal + newTotal;
+                row.set('الإجمالي بعد الخصم', newFinal);
+                
+                const newPoints = Math.floor(newFinal / 10);
+                row.set('نقاط الولاء', newPoints);
                 
                 const oldCount = parseInt(row.get('عدد العناصر')) || 0;
                 const newCount = newItems.reduce((sum, item) => sum + item.quantity, 0);
@@ -505,6 +518,24 @@ async function getUserTotalSpent(userId) {
                 let finalTotal = parseFloat(row.get('الإجمالي بعد الخصم')) || 0;
                 if (finalTotal === 0) finalTotal = parseFloat(row.get('الإجمالي')) || 0;
                 total += finalTotal;
+            }
+        }
+        return total;
+    } catch (error) {
+        return 0;
+    }
+}
+
+async function getUserLoyaltyPoints(userId) {
+    try {
+        const doc = await getDoc();
+        const sheet = doc.sheetsByTitle['Orders'];
+        if (!sheet) return 0;
+        const rows = await sheet.getRows();
+        let total = 0;
+        for (const row of rows) {
+            if (row.get('ID') === userId.toString() && row.get('الحالة') !== 'ملغي') {
+                total += parseFloat(row.get('نقاط الولاء')) || 0;
             }
         }
         return total;
@@ -796,6 +827,9 @@ async function showCart(ctx) {
     msg += `━━━━━━━━━━━━━━━\n`;
     msg += `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج`;
     
+    const points = Math.floor(discounts.finalTotal / 10);
+    msg += `\n⭐ <b>نقاط الولاء المتوقعة:</b> ${points} نقطة`;
+    
     buttons.push([Markup.button.callback('➕ إضافة منتجات', 'browse_products')]);
     buttons.push([Markup.button.callback('🎟️ إدخال كوبون', 'enter_coupon')]);
     buttons.push([Markup.button.callback('✅ تأكيد الطلب', 'checkout')]);
@@ -805,7 +839,7 @@ async function showCart(ctx) {
     await ctx.reply(msg, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
 }
 
-// ============ عرض العروض مع أزرار ============
+// ============ عرض العروض ============
 async function showOffers(ctx) {
     const offers = await getOffers();
     if (offers.length === 0) {
@@ -960,6 +994,7 @@ async function showOrders(ctx) {
             msg += `🎁 <b>الخصم:</b> -${order.discountAmount} ج\n`;
         }
         msg += `💎 <b>الإجمالي بعد الخصم:</b> ${order.finalTotal} ج\n`;
+        msg += `⭐ <b>نقاط الولاء المكتسبة:</b> ${order.loyaltyPoints} نقطة\n`;
         msg += `📍 <b>العنوان:</b> ${order.address}\n`;
         msg += `📞 <b>الهاتف:</b> ${order.phone}\n`;
         msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
@@ -1019,6 +1054,7 @@ async function trackOrder(ctx, orderNumber) {
         msg += `🎁 <b>الخصم:</b> -${order.discountAmount} ج\n`;
     }
     msg += `💎 <b>الإجمالي المدفوع:</b> ${order.finalTotal} ج\n`;
+    msg += `⭐ <b>نقاط الولاء المكتسبة:</b> ${order.loyaltyPoints} نقطة\n`;
     msg += `📍 <b>العنوان:</b> ${order.address}\n`;
     msg += `📞 <b>الهاتف:</b> ${order.phone}\n`;
     msg += `📅 <b>التاريخ:</b> ${order.date}\n`;
@@ -1158,7 +1194,7 @@ async function markItemForRemoval(ctx, itemIndex) {
     });
 }
 
-// ============ تأكيد حذف المنتجات مع إشعار الأدمن ============
+// ============ تأكيد حذف المنتجات ============
 async function confirmRemoveItems(ctx) {
     const userId = ctx.from.id;
     const session = sessions.get(userId);
@@ -1178,7 +1214,6 @@ async function confirmRemoveItems(ctx) {
             ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNumber}`)]])
         });
         
-        // إرسال إشعار للأدمن بحذف منتجات من الطلب
         const removedList = removedItems.map(item => `• ${item.quantity} × ${item.name} (${item.price}ج) = ${item.total}ج`).join('\n');
         const adminMsg = `🗑️ <b>تم حذف منتجات من طلب</b>\n━━━━━━━━━━━━━━━\n` +
             `👤 <b>العميل:</b> ${session.name || ctx.from.first_name}\n` +
@@ -1207,8 +1242,10 @@ async function showStats(ctx) {
     const userId = ctx.from.id;
     const orders = await getUserOrders(userId);
     const totalSpent = await getUserTotalSpent(userId);
+    const loyaltyPoints = await getUserLoyaltyPoints(userId);
     const session = sessions.get(userId) || new UserSession(userId);
     session.totalSpent = totalSpent;
+    session.loyaltyPoints = loyaltyPoints;
     sessions.set(userId, session);
     
     const pending = orders.filter(o => o.status === 'جاري التنفيذ').length;
@@ -1246,7 +1283,7 @@ async function showStats(ctx) {
         `❌ <b>ملغي:</b> ${cancelled}\n` +
         `💰 <b>إجمالي المشتريات:</b> ${totalSpent} ج\n` +
         `🎁 <b>إجمالي الخصومات:</b> ${totalDiscount} ج\n` +
-        `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
+        `⭐ <b>نقاط الولاء:</b> ${loyaltyPoints} نقطة\n` +
         (nextAmount > 0 ? `🎯 <b>للمستوى التالي:</b> أنفق ${nextAmount} ج أخرى` : `🏆 <b>أنت في أعلى مستوى!</b>`) +
         `\n\n💡 <b>ملاحظة:</b> كل 10 ج = 1 نقطة ولاء\n` +
         `❌ الطلبات الملغاة لا تحتسب في المشتريات`;
@@ -1341,7 +1378,6 @@ async function finishEdit(ctx) {
             ...Markup.inlineKeyboard([[Markup.button.callback('🔍 تتبع الطلب', `track_${orderNumber}`)]])
         });
         
-        // إرسال إشعار للأدمن بإضافة منتجات للطلب
         const addedList = addedItems.map(item => `• ${item.quantity} × ${item.name} (${item.price}ج) = ${item.price * item.quantity}ج`).join('\n');
         const adminMsg = `➕ <b>تم إضافة منتجات إلى طلب</b>\n━━━━━━━━━━━━━━━\n` +
             `👤 <b>العميل:</b> ${session.name || 'عميل'}\n` +
@@ -1376,7 +1412,7 @@ async function cancelEdit(ctx) {
     });
 }
 
-// ============ إلغاء الطلب مع إشعار الأدمن ============
+// ============ إلغاء الطلب ============
 async function handleCancelOrder(ctx, orderNumber) {
     const order = await getOrderByNumber(orderNumber);
     
@@ -1391,7 +1427,8 @@ async function handleCancelOrder(ctx, orderNumber) {
     
     await ctx.reply(`⚠️ <b>تأكيد إلغاء الطلب</b>\n\n` +
         `🏷️ ${order.orderNumber}\n` +
-        `💰 ${order.finalTotal} ج\n\n` +
+        `💰 ${order.finalTotal} ج\n` +
+        `⭐ نقاط الولاء: ${order.loyaltyPoints} نقطة\n\n` +
         `⚠️ <b>ملاحظة مهمة:</b>\n` +
         `• سيتم استرجاع نقاط الولاء\n` +
         `• سيتم خصم قيمة الطلب من إجمالي مشترياتك\n` +
@@ -1445,12 +1482,12 @@ async function confirmCancel(ctx) {
                 }
             );
             
-            // إرسال إشعار للأدمن بإلغاء الطلب
             const adminMsg = `❌ <b>تم إلغاء طلب</b>\n━━━━━━━━━━━━━━━\n` +
                 `👤 <b>العميل:</b> ${session.name || 'عميل'}\n` +
                 `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
                 `🏷️ <b>رقم الطلب:</b> <code>${session.tempOrderNumber}</code>\n` +
                 `💰 <b>قيمة الطلب:</b> ${order.finalTotal} ج\n` +
+                `⭐ <b>نقاط الولاء:</b> ${order.loyaltyPoints} نقطة\n` +
                 `📅 <b>تاريخ الطلب:</b> ${order.date}\n` +
                 `━━━━━━━━━━━━━━━\n` +
                 `🕐 <b>تاريخ الإلغاء:</b> ${new Date().toLocaleString('ar-EG')}`;
@@ -1497,6 +1534,8 @@ async function startCheckout(ctx) {
         discountSummary += `🎟️ خصم الكوبون (${discounts.couponDiscount.percent}%): -${discounts.couponDiscount.amount} ج\n`;
     }
     
+    const expectedPoints = Math.floor(discounts.finalTotal / 10);
+    
     if (lastData && session.useSavedAddress === null) {
         await ctx.reply(
             `🛍️ <b>تأكيد الطلب</b>\n━━━━━━━━━━━━━━━\n\n` +
@@ -1504,7 +1543,8 @@ async function startCheckout(ctx) {
             `\n💰 <b>المجموع:</b> ${discounts.subtotal} ج\n` +
             discountSummary +
             `━━━━━━━━━━━━━━━\n` +
-            `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
+            `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n` +
+            `⭐ <b>نقاط الولاء المتوقعة:</b> ${expectedPoints} نقطة\n━━━━━━━━━━━━━━━\n\n` +
             `📦 <b>هل تريد استخدام بياناتك السابقة؟</b>\n\n` +
             `📍 العنوان: ${lastData.address}\n` +
             `📞 الهاتف: ${lastData.phone}`,
@@ -1538,7 +1578,8 @@ async function startCheckout(ctx) {
         `💰 <b>المجموع:</b> ${discounts.subtotal} ج\n` +
         discountSummary +
         `━━━━━━━━━━━━━━━\n` +
-        `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n━━━━━━━━━━━━━━━\n\n` +
+        `💎 <b>الإجمالي بعد الخصم:</b> ${discounts.finalTotal} ج\n` +
+        `⭐ <b>نقاط الولاء المتوقعة:</b> ${expectedPoints} نقطة\n━━━━━━━━━━━━━━━\n\n` +
         `📝 أرسل اسمك الكامل:`,
         { parse_mode: 'HTML' }
     );
@@ -1547,12 +1588,11 @@ async function startCheckout(ctx) {
 async function saveOrderWithData(ctx, userId, cart, discounts) {
     const session = sessions.get(userId);
     const orderCart = [...cart];
+    const loyaltyPoints = Math.floor(discounts.finalTotal / 10);
     
     const saved = await saveOrder(
         userId, session.name || 'عميل', session.address, session.phone, cart,
-        discounts.subtotal, discounts.tierDiscount.amount,
-        discounts.couponDiscount.valid ? discounts.couponDiscount.amount : 0,
-        discounts.finalTotal, discounts.usedCoupon
+        discounts.subtotal, discounts.finalTotal, loyaltyPoints
     );
     
     if (saved.success) {
@@ -1596,11 +1636,12 @@ ${discountText}
 ━━━━━━━━━━━━━━━
 💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج
 ━━━━━━━━━━━━━━━
+⭐ <b>نقاط الولاء المكتسبة:</b> ${pointsEarned} نقطة
+━━━━━━━━━━━━━━━
 
 📍 <b>العنوان:</b> ${session.address}
 📞 <b>الهاتف:</b> ${session.phone}
 
-✨ <b>حصلت على ${pointsEarned} نقطة ولاء</b>
 🏆 <b>مستواك الحالي:</b> ${tier.name} (خصم ${tier.discount}%)
 
 📌 <b>لتتبع طلبك:</b>
@@ -1617,7 +1658,6 @@ ${discountText}
             ])
         });
         
-        // إرسال إشعار للأدمن بالطلب الجديد
         const adminMsg = `🛍️ <b>طلب جديد!</b>\n━━━━━━━━━━━━━━━\n` +
             `👤 <b>العميل:</b> ${session.name}\n` +
             `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
@@ -1629,12 +1669,12 @@ ${discountText}
             `💰 <b>المجموع:</b> ${discounts.subtotal} ج\n` +
             `${discountText}` +
             `💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج\n` +
+            `⭐ <b>نقاط الولاء:</b> ${pointsEarned} نقطة\n` +
             `━━━━━━━━━━━━━━━\n` +
             `📍 <b>العنوان:</b> ${session.address}\n` +
             `📞 <b>الهاتف:</b> ${session.phone}\n` +
             `━━━━━━━━━━━━━━━\n` +
             `🏆 <b>مستوى العميل:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
-            `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
             `━━━━━━━━━━━━━━━\n` +
             `🕐 <b>تاريخ الطلب:</b> ${new Date().toLocaleString('ar-EG')}`;
         
@@ -1693,14 +1733,18 @@ bot.start(async (ctx) => {
     if (!carts.has(userId)) carts.set(userId, []);
     
     const totalSpent = await getUserTotalSpent(userId);
+    const loyaltyPoints = await getUserLoyaltyPoints(userId);
     session.totalSpent = totalSpent;
+    session.loyaltyPoints = loyaltyPoints;
     const tier = session.getTier();
     
     const welcomeMsg = `🌟 <b>مرحباً بك في سوبر ماركت الحَواج!</b> 🌟\n━━━━━━━━━━━━━━━\n\n` +
         `👤 <b>الاسم:</b> ${ctx.from.first_name}\n` +
-        `🏆 <b>مستواك:</b> ${tier.name} (خصم ${tier.discount}%)\n\n` +
+        `🏆 <b>مستواك:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
+        `⭐ <b>نقاط الولاء:</b> ${loyaltyPoints} نقطة\n\n` +
         `🛒 أكبر سوبر ماركت في العالم!\n` +
-        `✅ توصيل سريع - أسعار تنافسية - جودة عالية\n━━━━━━━━━━━━━━━\n\n` +
+        `✅ توصيل سريع - أسعار تنافسية - جودة عالية\n` +
+        `💡 <b>ملاحظة:</b> كل 10 ج = 1 نقطة ولاء\n━━━━━━━━━━━━━━━\n\n` +
         `📌 اختر من القائمة:`;
     
     await ctx.reply(welcomeMsg, { parse_mode: 'HTML', ...mainKeyboard });
@@ -1965,7 +2009,6 @@ for (let i = 1; i <= 5; i++) {
             }
         );
         
-        // إرسال إشعار للأدمن بتقييم جديد
         const adminMsg = `⭐ <b>تقييم جديد</b>\n━━━━━━━━━━━━━━━\n` +
             `👤 <b>العميل:</b> ${session.name || ctx.from.first_name}\n` +
             `🆔 <b>المعرف:</b> <code>${userId}</code>\n` +
@@ -2079,9 +2122,7 @@ bot.on('text', async (ctx) => {
         
         const saved = await saveOrder(
             userId, session.name, session.address, session.phone, cart,
-            subtotal, discounts.tierDiscount.amount,
-            discounts.couponDiscount.valid ? discounts.couponDiscount.amount : 0,
-            discounts.finalTotal, discounts.usedCoupon
+            subtotal, discounts.finalTotal, Math.floor(discounts.finalTotal / 10)
         );
         
         if (saved.success) {
@@ -2125,11 +2166,12 @@ ${discountText}
 ━━━━━━━━━━━━━━━
 💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج
 ━━━━━━━━━━━━━━━
+⭐ <b>نقاط الولاء المكتسبة:</b> ${pointsEarned} نقطة
+━━━━━━━━━━━━━━━
 
 📍 <b>العنوان:</b> ${session.address}
 📞 <b>الهاتف:</b> ${session.phone}
 
-✨ <b>حصلت على ${pointsEarned} نقطة ولاء</b>
 🏆 <b>مستواك الحالي:</b> ${tier.name} (خصم ${tier.discount}%)
 
 📌 <b>لتتبع طلبك:</b>
@@ -2157,12 +2199,12 @@ ${discountText}
                 `💰 <b>المجموع:</b> ${subtotal} ج\n` +
                 `${discountText}` +
                 `💎 <b>الإجمالي المدفوع:</b> ${discounts.finalTotal} ج\n` +
+                `⭐ <b>نقاط الولاء:</b> ${pointsEarned} نقطة\n` +
                 `━━━━━━━━━━━━━━━\n` +
                 `📍 <b>العنوان:</b> ${session.address}\n` +
                 `📞 <b>الهاتف:</b> ${session.phone}\n` +
                 `━━━━━━━━━━━━━━━\n` +
                 `🏆 <b>مستوى العميل:</b> ${tier.name} (خصم ${tier.discount}%)\n` +
-                `⭐ <b>نقاط الولاء:</b> ${session.loyaltyPoints}\n` +
                 `━━━━━━━━━━━━━━━\n` +
                 `🕐 <b>تاريخ الطلب:</b> ${new Date().toLocaleString('ar-EG')}`;
             
